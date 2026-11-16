@@ -1,7 +1,16 @@
 "use client";
 
-import { useCallback, useMemo, useState, type ReactNode } from "react";
-import { Code2, Download, Eye } from "lucide-react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { Code2, Download, Eye, Maximize2, Minimize2 } from "lucide-react";
+
+export const WorkspaceStageContext = createContext<{
+  container: HTMLElement | null;
+  hasFloatingControls: boolean;
+}>({
+  container: null,
+  hasFloatingControls: false,
+});
 
 /* ─────────────────────────────────────────────────────────
  * CODE BLOCK
@@ -139,6 +148,13 @@ function buildHtmlSrcDoc(raw: string): string {
 </html>`;
 }
 
+function extractHtmlTitle(raw: string): string | null {
+  const match = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(raw);
+  if (!match) return null;
+  const cleaned = match[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+  return cleaned || null;
+}
+
 export default function CodeBlock({
   lines = CODE_LINES,
   code,
@@ -150,6 +166,8 @@ export default function CodeBlock({
 }: CodeBlockProps) {
   const [copied, setCopied] = useState(false);
   const [manualViewMode, setManualViewMode] = useState<"preview" | "code" | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const workspaceStage = useContext(WorkspaceStageContext);
   const text = { ...DEFAULT_LABELS, ...labels };
   const raw = code ?? lines.join("\n");
 
@@ -159,9 +177,27 @@ export default function CodeBlock({
     : "code";
 
   const srcDoc = useMemo(
-    () => (viewMode === "preview" ? buildHtmlSrcDoc(raw) : ""),
-    [viewMode, raw]
+    () => (canPreviewHtml && viewMode === "preview" ? buildHtmlSrcDoc(raw) : ""),
+    [canPreviewHtml, viewMode, raw]
   );
+
+  const htmlTitle = useMemo(
+    () => (canPreviewHtml ? extractHtmlTitle(raw) : null),
+    [canPreviewHtml, raw]
+  );
+
+  useEffect(() => {
+    if (!isFullscreen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setIsFullscreen(false);
+      }
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
+  }, [isFullscreen]);
 
   const copy = useCallback(() => {
     navigator.clipboard.writeText(raw).then(() => {
@@ -231,6 +267,19 @@ export default function CodeBlock({
                   </>
                 )}
               </button>
+
+              <button
+                type="button"
+                aria-label="Fullscreen preview"
+                title="Fullscreen"
+                onClick={() => {
+                  setManualViewMode("preview");
+                  setIsFullscreen(true);
+                }}
+                className="flex h-7 w-7 items-center justify-center rounded-[6px] text-ink-3 transition-colors duration-100 hover:bg-hover hover:text-ink"
+              >
+                <Maximize2 className="size-3.5" />
+              </button>
             </>
           )}
 
@@ -295,6 +344,136 @@ export default function CodeBlock({
           </div>
         </div>
       )}
+
+      {isFullscreen &&
+        canPreviewHtml &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={htmlTitle || filename || "HTML Preview"}
+            className={`${
+              workspaceStage.container
+                ? "absolute inset-0 z-20"
+                : "fixed inset-0 z-[100]"
+            } flex flex-col bg-page text-ink`}
+          >
+            {/* Fullscreen Top Toolbar */}
+            <div
+              className={`flex h-13 shrink-0 items-center justify-between gap-3 border-b border-line bg-surface px-4 sm:h-14 sm:px-5 ${
+                workspaceStage.container && workspaceStage.hasFloatingControls
+                  ? "pl-40 sm:pl-44"
+                  : ""
+              }`}
+            >
+              <div className="flex min-w-0 items-center gap-2.5">
+                <FileIcon />
+                <span className="truncate text-[14px] font-semibold text-ink">
+                  {htmlTitle || filename || "HTML Preview"}
+                </span>
+                {htmlTitle && filename && (
+                  <span className="hidden shrink-0 rounded-[6px] border border-line bg-inset px-2 py-0.5 font-mono text-[11px] text-ink-3 sm:inline-flex">
+                    {filename}
+                  </span>
+                )}
+              </div>
+
+              <div className="flex shrink-0 items-center gap-2">
+                <div
+                  role="tablist"
+                  aria-label="Preview mode"
+                  className="inline-flex items-center rounded-[10px] border border-line bg-inset p-0.5"
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={viewMode === "code"}
+                    onClick={() => setManualViewMode("code")}
+                    className={`flex h-7 items-center gap-1.5 rounded-[8px] px-2.5 text-[12px] font-medium transition-colors ${
+                      viewMode === "code"
+                        ? "bg-surface text-ink shadow-xs"
+                        : "text-ink-2 hover:text-ink"
+                    }`}
+                  >
+                    <Code2 className="size-3.5" />
+                    <span>Code</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={viewMode === "preview"}
+                    onClick={() => setManualViewMode("preview")}
+                    className={`flex h-7 items-center gap-1.5 rounded-[8px] px-2.5 text-[12px] font-medium transition-colors ${
+                      viewMode === "preview"
+                        ? "bg-surface text-ink shadow-xs"
+                        : "text-ink-2 hover:text-ink"
+                    }`}
+                  >
+                    <Eye className="size-3.5" />
+                    <span>Preview</span>
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={downloadFile}
+                  aria-label="Download HTML file"
+                  title="Download HTML"
+                  className="flex h-8 items-center gap-1.5 rounded-[9px] border border-line-strong/80 bg-surface px-2.5 text-[12px] font-medium text-ink shadow-xs transition-colors hover:bg-hover"
+                >
+                  <Download className="size-3.5" />
+                  <span className="hidden sm:inline">Download</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={copy}
+                  aria-label="Copy code"
+                  title="Copy code"
+                  className={`flex h-8 items-center gap-1.5 rounded-[9px] border border-line-strong/80 bg-surface px-2.5 text-[12px] font-medium shadow-xs transition-colors hover:bg-hover ${
+                    copied ? "text-green" : "text-ink"
+                  }`}
+                >
+                  {copied ? text.copied : text.copy}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setIsFullscreen(false)}
+                  aria-label="Exit fullscreen"
+                  title="Exit fullscreen (Esc)"
+                  className="flex size-8 items-center justify-center rounded-[9px] border border-line-strong/80 bg-surface text-ink-2 shadow-xs transition-colors hover:bg-hover hover:text-ink"
+                >
+                  <Minimize2 className="size-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Fullscreen Content Stage */}
+            <div className="min-h-0 flex-1 overflow-hidden bg-page">
+              {viewMode === "preview" ? (
+                <iframe
+                  title={htmlTitle || filename || "HTML Preview"}
+                  srcDoc={srcDoc}
+                  sandbox="allow-scripts"
+                  className="block h-full w-full border-0 bg-white"
+                />
+              ) : (
+                <div className="h-full w-full overflow-auto bg-surface px-5 py-4 font-mono text-[13px] leading-[1.7] text-ink-2 sm:px-8 sm:py-6">
+                  <div className="mx-auto flex max-w-5xl flex-col">
+                    {lines.map((line, i) => (
+                      <code key={i} className="block break-words whitespace-pre-wrap">
+                        {line === "" ? "\u00A0" : highlight(line)}
+                      </code>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>,
+          workspaceStage.container ?? document.body
+        )}
     </div>
   );
 }

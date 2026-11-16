@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, ArrowUpRight, Globe, Square, Volume2, WifiOff } from "lucide-react";
 import { onAuthStateChanged, type User as FirebaseUser } from "firebase/auth";
-import CodeBlock from "./components/CodeBlock";
+import CodeBlock, { WorkspaceStageContext } from "./components/CodeBlock";
 import InlineHtmlPreview from "./components/InlineHtmlPreview";
 import MarkdownRenderer from "./components/MarkdownRenderer";
 import {
@@ -758,6 +758,14 @@ export default function App() {
   const prevMsgCountRef = useRef(0);
   const prevThreadIdRef = useRef<string | null>(null);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [workspaceStageEl, setWorkspaceStageEl] = useState<HTMLDivElement | null>(null);
+  const workspaceStageValue = useMemo(
+    () => ({
+      container: workspaceStageEl,
+      hasFloatingControls: sidebarCollapsed || isMobile,
+    }),
+    [workspaceStageEl, sidebarCollapsed, isMobile]
+  );
 
   const [localModelStatus, setLocalModelStatus] = useState<LocalModelStatus>("idle");
   const [localDownloadProgress, setLocalDownloadProgress] = useState(0);
@@ -2928,15 +2936,17 @@ export default function App() {
       />
 
       {/* Main Workspace Area (clean inset rounded frame on desktop) */}
-      <div
-        className={`relative flex min-w-0 flex-1 flex-col overflow-hidden bg-page md:my-2 md:mr-2 md:rounded-[16px] md:border md:border-line md:shadow-xs ${
-          sidebarCollapsed ? "md:ml-2" : ""
-        }`}
-      >
+      <WorkspaceStageContext.Provider value={workspaceStageValue}>
+        <div
+          ref={setWorkspaceStageEl}
+          className={`relative flex min-w-0 flex-1 flex-col overflow-hidden bg-page md:my-2 md:mr-2 md:rounded-[16px] md:border md:border-line md:shadow-xs ${
+            sidebarCollapsed ? "md:ml-2" : ""
+          }`}
+        >
         {/* Top-left floating bar when sidebar is closed */}
         {(sidebarCollapsed || isMobile) && (
           <div
-            className="pointer-events-none absolute top-3 left-4 z-30 flex flex-col items-start gap-2.5"
+            className="pointer-events-none absolute top-2.5 left-4 z-30 flex flex-col items-start gap-2.5"
             style={{ animation: "pop-in 200ms cubic-bezier(0.23,1,0.32,1) both" }}
           >
             <div className="pointer-events-auto flex items-center gap-3">
@@ -2960,7 +2970,7 @@ export default function App() {
                   title="Open sidebar"
                   className="flex size-7 items-center justify-center rounded-full text-ink-2 transition-colors hover:bg-hover-2 hover:text-ink"
                 >
-                  <IconSidebarLeftArrow size={16} className="rotate-180" />
+                  <IconSidebarLeftArrow size={16} direction="right" />
                 </button>
                 <button
                   type="button"
@@ -3376,7 +3386,8 @@ export default function App() {
             </div>
           </div>
         )}
-      </div>
+        </div>
+      </WorkspaceStageContext.Provider>
 
       {/* Centered Login Modal (Google Firebase Auth + Built-in Email Auth) */}
       <LoginModal

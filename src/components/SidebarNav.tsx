@@ -501,7 +501,7 @@ export default function SidebarNav({
 
   const sidebarBody = (
     <div className={`flex min-h-0 shrink-0 flex-col py-2 ${isMobile ? "w-full flex-1" : "w-[224px]"}`}>
-        <div className="relative mb-2.5 h-10 shrink-0">
+        <div className="relative mb-1 h-14 shrink-0">
           <button
             type="button"
             tabIndex={collapsed ? -1 : 0}
@@ -511,7 +511,7 @@ export default function SidebarNav({
               onNewChat?.();
               if (isMobile) collapse();
             }}
-            className="sidebar-workspace-control absolute left-2 top-1 flex h-8 w-[164px] items-center rounded-[8px] px-2 text-left transition-[background-color,transform] duration-100 hover:bg-hover-2 active:scale-[0.99]"
+            className="sidebar-workspace-control absolute left-2 top-3 flex h-8 w-[164px] items-center rounded-[8px] px-2 text-left transition-[background-color,transform] duration-100 hover:bg-hover-2 active:scale-[0.99]"
           >
             <span className="sidebar-logo flex size-5 shrink-0 items-center justify-center text-ink">
               <NexoraLogo size={18} />
@@ -526,7 +526,7 @@ export default function SidebarNav({
             aria-label={isMobile ? "Close menu" : "Collapse sidebar"}
             tabIndex={collapsed ? -1 : 0}
             onClick={collapse}
-            className="sidebar-collapse-control absolute right-2 top-1 flex size-8 items-center justify-center rounded-[8px] text-ink-3 transition-[opacity,background-color,color] duration-150 hover:bg-hover-2 hover:text-ink"
+            className="sidebar-collapse-control absolute right-2 top-3 flex size-8 items-center justify-center rounded-[8px] text-ink-3 transition-[opacity,background-color,color] duration-150 hover:bg-hover-2 hover:text-ink"
           >
             {isMobile ? <IconCrossSmall size={18} /> : <IconSidebarLeftArrow size={18} />}
           </button>

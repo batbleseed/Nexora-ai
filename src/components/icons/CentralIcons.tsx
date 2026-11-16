@@ -91,12 +91,20 @@ export function IconSettingsGear1({ size = 16, className }: IconProps) {
   );
 }
 
-export function IconSidebarLeftArrow({ size = 18, className }: IconProps) {
+export function IconSidebarLeftArrow({
+  size = 18,
+  className,
+  direction = "left",
+}: IconProps & { direction?: "left" | "right" }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
       <rect x="3" y="4" width="18" height="16" rx="3" />
       <path d="M9 4v16" />
-      <path d="M16 10l-2 2 2 2" />
+      {direction === "right" ? (
+        <path d="M14 10l2 2-2 2" />
+      ) : (
+        <path d="M16 10l-2 2 2 2" />
+      )}
     </svg>
   );
 }

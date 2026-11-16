@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import http from "node:http";
 import path from "node:path";
 import express, { type Request, type Response } from "express";
 import dotenv from "dotenv";
@@ -2138,6 +2139,8 @@ async function startServer() {
     }
   });
 
+  const httpServer = http.createServer(app);
+
   // --- Vite / Static Frontend Serving ---
   if (process.env.NODE_ENV === "production") {
     const distDir = path.resolve(process.cwd(), "dist");
@@ -2148,13 +2151,19 @@ async function startServer() {
   } else {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr:
+          process.env.DISABLE_HMR === "true"
+            ? false
+            : { server: httpServer },
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`Nexora server running on http://0.0.0.0:${PORT}`);
   });
 }
