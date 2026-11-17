@@ -256,8 +256,12 @@ interface ByokConfig {
 }
 
 function resolveByokConfig(byok: ByokConfig, model: string): ByokConfig {
+  const cleanModel = model.trim();
+  if (cleanModel === "Nexora Assistant" || cleanModel === "Nexora Nano (Local)") {
+    return {};
+  }
   const saved = Array.isArray(byok.savedModels) ? byok.savedModels : [];
-  const match = saved.find((m) => (m.id || "").trim() === model.trim());
+  const match = saved.find((m) => (m.id || "").trim() === cleanModel);
   if (match) {
     return {
       preset: match.preset ?? byok.preset,
@@ -401,8 +405,14 @@ function decodeHtmlEntities(str: string): string {
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
+    .replace(/&#39;|&apos;|&rsquo;|&lsquo;/g, "'")
+    .replace(/&rdquo;|&ldquo;/g, '"')
     .replace(/&nbsp;/g, " ")
+    .replace(/&trade;/g, "™")
+    .replace(/&mdash;/g, "—")
+    .replace(/&ndash;/g, "–")
+    .replace(/&hellip;/g, "...")
+    .replace(/&#x([0-9a-f]+);/gi, (_m, hex) => String.fromCharCode(parseInt(hex, 16) || 32))
     .replace(/&#(\d+);/g, (_m, dec) => String.fromCharCode(Number(dec) || 32));
 }
 
@@ -588,6 +598,208 @@ async function searchWebInfo(
   }
 
   return results;
+}
+
+const IGNORED_CRAWL_EXT_RE =
+  /\.(?:png|jpe?g|gif|svg|webp|ico|css|js|mjs|woff2?|ttf|eot|pdf|zip|tar|gz|mp3|mp4|webm|xml|json)$/i;
+const IGNORED_CRAWL_PATH_RE =
+  /\/(?:login|signin|sign-in|signup|sign-up|register|cart|checkout|account|privacy|terms|cookie|wp-json|wp-admin|feed|cdn-cgi|Special:|File:|Talk:|User:|Help:)/i;
+const BOILERPLATE_LINE_RE =
+  /\b(accept\s+(?:all\s+)?cookies|cookie\s+policy|privacy\s+policy|terms\s+of\s+(?:use|service)|all\s+rights\s+reserved|skip\s+to\s+(?:main\s+)?content|toggle\s+navigation|sign\s+(?:in|up)|log\s+(?:in|out)|subscribe\s+now|copyright\s+©|powered\s+by|javascript\s+is\s+disabled)\b/i;
+
+function htmlToCleanProseCorpus(
+  html: string,
+  fallbackTitle: string,
+  maxChars = 28_000
+): { title: string; text: string } {
+  const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  const title =
+    decodeHtmlEntities((titleMatch?.[1] ?? "").replace(/\s+/g, " ").trim()) ||
+    fallbackTitle;
+
+  const stripped = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<nav[\s\S]*?<\/nav>/gi, "\n")
+    .replace(/<footer[\s\S]*?<\/footer>/gi, "\n")
+    .replace(/<header[\s\S]*?<\/header>/gi, "\n")
+    .replace(/<\/(p|div|section|article|li|tr|h[1-6]|br|blockquote)>/gi, "\n")
+    .replace(/<(li|h[1-6]|tr|p)[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+
+  const seenLines = new Set<string>();
+  const cleanLines: string[] = [];
+  let charCount = 0;
+
+  for (const rawLine of decodeHtmlEntities(stripped).split("\n")) {
+    const line = rawLine.replace(/\[\d+\]|\[edit\]/gi, " ").replace(/\s+/g, " ").trim();
+    if (line.length < 32 || line.length > 900) continue;
+    if (BOILERPLATE_LINE_RE.test(line)) continue;
+    const alphaCount = (line.match(/[a-zA-Z]/g) || []).length;
+    if (alphaCount < line.length * 0.55) continue;
+    const key = line.toLowerCase().slice(0, 72);
+    if (seenLines.has(key)) continue;
+    seenLines.add(key);
+    cleanLines.push(line);
+    charCount += line.length + 1;
+    if (charCount >= maxChars) break;
+  }
+
+  return { title, text: cleanLines.join("\n").slice(0, maxChars) };
+}
+
+function extractSameOriginLinks(html: string, baseUrl: string, limit = 14): string[] {
+  const baseParsed = isSafeExternalUrl(baseUrl);
+  if (!baseParsed) return [];
+
+  const links: string[] = [];
+  const seen = new Set<string>([baseParsed.toString().split("#")[0]]);
+  const hrefRegex = /<a\b[^>]*href=["']([^"'#]+)["']/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = hrefRegex.exec(html)) !== null && links.length < limit) {
+    const rawHref = decodeHtmlEntities(match[1].trim());
+    if (!rawHref || rawHref.startsWith("mailto:") || rawHref.startsWith("javascript:")) {
+      continue;
+    }
+    try {
+      const resolved = new URL(rawHref, baseParsed);
+      resolved.hash = "";
+      const safe = isSafeExternalUrl(resolved.toString());
+      if (!safe) continue;
+      if (safe.hostname !== baseParsed.hostname) continue;
+      if (IGNORED_CRAWL_EXT_RE.test(safe.pathname)) continue;
+      if (IGNORED_CRAWL_PATH_RE.test(safe.pathname)) continue;
+      const norm = safe.toString();
+      if (seen.has(norm)) continue;
+      seen.add(norm);
+      links.push(norm);
+    } catch {
+      // ignore invalid relative links
+    }
+  }
+
+  return links;
+}
+
+async function fetchRawHtmlAndProse(
+  rawUrl: string,
+  signal?: AbortSignal,
+  maxChars = 28_000
+): Promise<{ url: string; title: string; html: string; text: string }> {
+  const parsed = isSafeExternalUrl(rawUrl);
+  if (!parsed) {
+    throw new Error("Blocked or invalid external URL.");
+  }
+  const timeoutSignal = AbortSignal.timeout(7_500);
+  const combinedSignal = signal
+    ? AbortSignal.any([signal, timeoutSignal])
+    : timeoutSignal;
+
+  const res = await fetch(parsed.toString(), {
+    signal: combinedSignal,
+    redirect: "follow",
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; NexoraCorpusHarvester/1.0)",
+      Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} fetching ${parsed.hostname}`);
+  }
+
+  const contentType = (res.headers.get("content-type") || "").toLowerCase();
+  const rawBody = (await res.text()).slice(0, 450_000);
+  const finalUrl = res.url || parsed.toString();
+
+  if (contentType.includes("text/html") || contentType.includes("application/xhtml")) {
+    const clean = htmlToCleanProseCorpus(rawBody, parsed.hostname, maxChars);
+    return { url: finalUrl, title: clean.title, html: rawBody, text: clean.text };
+  }
+
+  const plainLines = rawBody
+    .split("\n")
+    .map((l) => l.replace(/\s+/g, " ").trim())
+    .filter((l) => l.length >= 24);
+  return {
+    url: finalUrl,
+    title: parsed.hostname,
+    html: "",
+    text: plainLines.join("\n").slice(0, maxChars),
+  };
+}
+
+function cleanWikiArticleText(raw: string, maxChars = 24_000): string {
+  const lines: string[] = [];
+  let charCount = 0;
+  for (const rawLine of raw.split("\n")) {
+    const line = rawLine.replace(/\s+/g, " ").trim();
+    if (!line || line.startsWith("==")) continue;
+    if (line.length < 32) continue;
+    lines.push(line);
+    charCount += line.length + 1;
+    if (charCount >= maxChars) break;
+  }
+  return lines.join("\n").slice(0, maxChars);
+}
+
+async function fetchFullWikipediaBatch(
+  titles: string[],
+  signal?: AbortSignal,
+  perArticleMaxChars = 22_000
+): Promise<Array<{ title: string; url: string; text: string }>> {
+  if (titles.length === 0) return [];
+  const timeoutSignal = AbortSignal.timeout(8_500);
+  const combinedSignal = signal
+    ? AbortSignal.any([signal, timeoutSignal])
+    : timeoutSignal;
+
+  // MediaWiki caps full-text prop=extracts to 1 article per request unless exintro=1 is set;
+  // process in small concurrent waves with a standard User-Agent to avoid burst rate limits.
+  const out: Array<{ title: string; url: string; text: string }> = [];
+  for (let i = 0; i < titles.length; i += 4) {
+    if (combinedSignal.aborted) break;
+    const chunk = titles.slice(i, i + 4);
+    const settled = await Promise.allSettled(
+      chunk.map(async (title) => {
+        const extractUrl = `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&redirects=1&titles=${encodeURIComponent(
+          title
+        )}&format=json`;
+        const res = await fetch(extractUrl, {
+          signal: combinedSignal,
+          headers: {
+            "User-Agent": "NexoraAssistant/1.0 (educational-typescript-engine)",
+          },
+        });
+        if (!res.ok) return null;
+        const data = (await res.json()) as {
+          query?: { pages?: Record<string, { title?: string; extract?: string }> };
+        };
+        for (const page of Object.values(data.query?.pages ?? {})) {
+          if (!page.title || !page.extract) continue;
+          if (/^\S.{0,50}\bmay refer to:/i.test(page.extract) && page.extract.length < 350) {
+            continue;
+          }
+          const text = cleanWikiArticleText(page.extract, perArticleMaxChars);
+          if (text.length < 180) continue;
+          return {
+            title: `${page.title} — Wikipedia`,
+            url: `https://en.wikipedia.org/wiki/${encodeURIComponent(page.title.replace(/ /g, "_"))}`,
+            text,
+          };
+        }
+        return null;
+      })
+    );
+    for (const item of settled) {
+      if (item.status === "fulfilled" && item.value) {
+        out.push(item.value);
+      }
+    }
+  }
+  return out;
 }
 
 function addJobSources(job: ChatJob, incoming: StoredSource[]) {
@@ -1245,10 +1457,10 @@ async function runJobInBackground(
       : "";
   const effortDirective =
     job.effort === "Low"
-      ? "4. REASONING DEPTH (Low): Prioritize speed and conciseness. Give direct, clear answers without lengthy deliberation."
+      ? "5. REASONING DEPTH (Low): Prioritize speed and conciseness. Give direct, clear answers without lengthy deliberation."
       : job.effort === "Max Effort"
-        ? "4. REASONING DEPTH (Max Effort): Think deeply and methodically before answering. Double-check logic, calculations, code edge cases, and retrieved facts, and provide a thorough, high-precision response."
-        : "4. REASONING DEPTH (Medium): Provide a well-balanced, clear, and practical response with appropriate explanation.";
+        ? "5. REASONING DEPTH (Max Effort): Think deeply and methodically before answering. Double-check logic, calculations, code edge cases, and retrieved facts, and provide a thorough, high-precision response."
+        : "5. REASONING DEPTH (Medium): Provide a well-balanced, clear, and practical response with appropriate explanation.";
   const systemInstruction = [
     "You are Nexora Assistant, a clear, concise, and practical AI workspace assistant.",
     "Always structure your explanations using clean Markdown (headings, lists, tables, bold, and inline code where helpful).",
@@ -1256,6 +1468,7 @@ async function runJobInBackground(
     "1. INLINE INTERACTIVE PREVIEW (view-only visual result — no source code is shown to the user): Whenever a chart, graph, business/analytics card grid, diagram, timeline, interactive calculator, unit converter, live comparison widget, or visual UI demonstration communicates better than plain text or a static table—or whenever the user asks to show/visualize data, a chart, or an interactive view—output normal Markdown prose before and/or after an embedded fenced block with the exact info string ```nexora-preview (closed with ```). Keep everything inside ```nexora-preview strictly self-contained using inline HTML, CSS, SVG, or Canvas with vanilla JavaScript (avoid external CDNs so previews render instantaneously). Make layouts responsive at 100% width with balanced padding (e.g., 12px-18px) and style them cleanly using the workspace CSS variables var(--surface), var(--inset), var(--ink), var(--ink-2), var(--ink-3), var(--line), var(--accent), var(--green), var(--orange), and var(--red) so light and dark themes look native.",
     "2. HTML SOURCE CODE BLOCK: Use a normal ```html fenced code block only when the user explicitly wants HTML source code, asks for an HTML file/template to copy or download, or asks how HTML is written.",
     "3. WEBSITE BROWSING & LIVE WEB SEARCH: You have real-time web browsing and search tools enabled (URL reading via urlContext/browse_url and live web search via googleSearch/web_search). Whenever the user shares a URL (http:// or https://), asks you to read, summarize, or verify a webpage, or asks about current events, live prices, recent releases, documentation updates, or real-world facts, actively browse the URL or search the web rather than claiming you cannot access the internet. Ground your answer in the retrieved findings and cite the source links clearly.",
+    "4. PURE TYPESCRIPT NEURAL ENGINE LAB: Whenever the user asks about or wants to learn, build, or experiment with micrograd, scalar autograd, backpropagation, computation graphs, transformer self-attention, scaled dot-product attention, softmax, LayerNorm, or matrix multiplication in pure TypeScript without external libraries, teach the underlying math cleanly in pure TypeScript and embed an interactive lab fence using ```nexora-lab containing a single keyword (micrograd, attention, or matmul) closed with ``` so the user can inspect live weights, gradients, attention heatmaps, and dot-product traces directly inside the chat.",
     effortDirective,
     languageDirective,
   ]
@@ -1322,7 +1535,36 @@ async function runJobInBackground(
   };
 
   try {
-    const model = job.model;
+    const model = job.model.trim();
+    if (model === "Nexora Assistant" || model === "Nexora Nano (Local)") {
+      job.thinkingLines = ["Running Nexora Assistant (Built-in Mode — no external providers)"];
+      const cleanPrompt = prompt.trim().toLowerCase();
+      let builtInMarkdown =
+        "**Nexora Assistant (Built-in)** does not connect to external providers or third-party APIs.\n\n" +
+        "- Send `/micrograd`, `/attention`, or `/matmul` to explore the pure-TypeScript neural & transformer labs.\n" +
+        "- Or choose a configured BYOK model in **Settings → Models** if you want to connect to an external provider.";
+
+      if (/(micrograd|autograd|backprop|chain rule|\bxor\b|\bmlp\b)/.test(cleanPrompt)) {
+        builtInMarkdown =
+          "### Pure TypeScript Micrograd & Backpropagation\n\n```nexora-lab\nmicrograd\n```";
+      } else if (/(transformer|attention|softmax|layernorm|\bqkv\b)/.test(cleanPrompt)) {
+        builtInMarkdown =
+          "### Pure TypeScript Transformer Self-Attention\n\n```nexora-lab\nattention\n```";
+      } else if (/(matrix|matmul|dot product)/.test(cleanPrompt)) {
+        builtInMarkdown =
+          "### Pure TypeScript Matrix Multiplication\n\n```nexora-lab\nmatmul\n```";
+      }
+
+      job.status = "completed";
+      job.text = builtInMarkdown;
+      job.thinkingDurationMs = Math.max(100, Date.now() - startedAt);
+      job.updatedAt = Date.now();
+      syncJobIntoWorkspaceThread(job);
+      notifyJobListeners(job);
+      await persistStore();
+      return;
+    }
+
     const effectiveByok = resolveByokConfig(byok, model);
     const baseUrl = (effectiveByok.baseUrl || "").trim();
     const apiKey = (effectiveByok.apiKey || "").trim();
@@ -1332,35 +1574,13 @@ async function runJobInBackground(
       (effectiveByok.modelId || "").trim() ||
       getDefaultModelForPreset(preset);
 
-    const geminiServerKey = process.env.GEMINI_API_KEY?.trim() || "";
-    const hasServerGeminiKey =
-      Boolean(geminiServerKey) && geminiServerKey !== "MY_GEMINI_API_KEY";
+    const targetModel = model || configuredByokModel;
 
-    if (model === "Nexora Assistant" && hasServerGeminiKey && !apiKey) {
-      await runGeminiStream(
-        job,
-        prompt,
-        history,
-        attachments,
-        "gemini-4-hydrogen",
-        geminiServerKey,
-        systemInstruction,
-        controller.signal,
-        appendDelta,
-        appendThought,
-        appendSources,
-        addThinkingLine,
-        true
+    if (!baseUrl || !targetModel) {
+      throw new Error(
+        "Configure your Base URL, API key, and Model selection in Settings → Models before sending."
       );
-    } else {
-      const targetModel =
-        model === "Nexora Assistant" ? configuredByokModel : model.trim() || configuredByokModel;
-
-      if (!baseUrl || !targetModel) {
-        throw new Error(
-          "Configure your Base URL, API key, and Model selection in Settings → Models before sending."
-        );
-      }
+    }
 
       const isLocalUrl =
         baseUrl.includes("localhost") || baseUrl.includes("127.0.0.1");
@@ -1473,7 +1693,6 @@ async function runJobInBackground(
           addThinkingLine
         );
       }
-    }
 
     if (stoppedJobIds.has(job.id) || controller.signal.aborted) {
       finalizeStoppedJob(job);
@@ -1535,6 +1754,461 @@ async function startServer() {
   // --- Health check ---
   app.get("/api/health", (_req: Request, res: Response) => {
     res.json({ ok: true });
+  });
+
+  // --- Pure-HTTP Public Research Lookup for Built-in Nexora Assistant (Zero External AI Providers) ---
+  app.post("/api/assistant/research", async (req: Request, res: Response) => {
+    const query = String(req.body?.query || "").trim();
+    if (!query || query.length > 600) {
+      return res.json({ passages: [] });
+    }
+
+    const passages: Array<{ title: string; url: string; text: string; authority: number }> = [];
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 9000);
+
+    try {
+      const explicitUrls = extractUrlsFromText(query).slice(0, 2);
+      const urlTask = Promise.all(
+        explicitUrls.map(async (targetUrl) => {
+          try {
+            const page = await fetchWebPageContent(targetUrl, controller.signal);
+            passages.push({
+              title: page.title,
+              url: page.url,
+              text: page.content.slice(0, 6500),
+              authority: 1.55,
+            });
+          } catch {
+            // Skip unreachable URL
+          }
+        })
+      );
+
+      // Clean search query without raw URLs, question wrappers, or leading articles ("what is a capital" -> "capital")
+      const isDefinitionQuestion =
+        /^(what\s+(?:is|are|does)|what's|define|definition\s+of|meaning\s+of)\b/i.test(
+          query
+        );
+      let cleanSearchQuery = query
+        .replace(/https?:\/\/\S+/gi, " ")
+        .replace(
+          /^(what\s+(?:is|are)|what's|who\s+(?:is|are)|explain|tell\s+me\s+about|how\s+does|why\s+does|define|definition\s+of|meaning\s+of)\s+/i,
+          ""
+        )
+        .replace(/^(a|an|the)\s+/i, "")
+        .replace(/\s+(?:mean|meaning|definition)[?!.]*$/i, "")
+        .replace(/[?!.]+$/, "")
+        .trim();
+      if (!cleanSearchQuery) {
+        cleanSearchQuery = query.replace(/[?!.]+$/, "").trim();
+      }
+      const cleanWords = cleanSearchQuery.split(/\s+/).filter(Boolean);
+
+      // 1. Dictionary API lookup for single-word or definition queries
+      const dictTask = (async () => {
+        if (explicitUrls.length > 0) return;
+        const singleWord =
+          cleanWords.length === 1 && /^[a-zA-Z-]{2,32}$/.test(cleanWords[0])
+            ? cleanWords[0].toLowerCase()
+            : null;
+        if (!singleWord) return;
+
+        try {
+          const dictRes = await fetch(
+            `https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(singleWord)}`,
+            {
+              signal: controller.signal,
+              headers: { "User-Agent": "NexoraAssistant/1.0" },
+            }
+          );
+          if (!dictRes.ok) return;
+          const entries = (await dictRes.json()) as Array<{
+            word?: string;
+            phonetic?: string;
+            meanings?: Array<{
+              partOfSpeech?: string;
+              definitions?: Array<{ definition?: string; example?: string }>;
+            }>;
+          }>;
+          if (!Array.isArray(entries) || entries.length === 0) return;
+
+          const lines: string[] = [];
+          const seenDefs = new Set<string>();
+          for (const entry of entries.slice(0, 2)) {
+            for (const meaning of entry.meanings ?? []) {
+              const pos = meaning.partOfSpeech ? `(${meaning.partOfSpeech})` : "";
+              for (const def of (meaning.definitions ?? []).slice(0, 2)) {
+                const d = (def.definition || "").trim();
+                if (!d || seenDefs.has(d.toLowerCase())) continue;
+                seenDefs.add(d.toLowerCase());
+                lines.push(`${pos ? `${pos} ` : ""}${d}`);
+                if (lines.length >= 6) break;
+              }
+              if (lines.length >= 6) break;
+            }
+            if (lines.length >= 6) break;
+          }
+
+          if (lines.length > 0) {
+            const displayWord = entries[0]?.word || singleWord;
+            passages.push({
+              title: `${displayWord} — Dictionary Definition`,
+              url: `https://en.wiktionary.org/wiki/${encodeURIComponent(displayWord)}`,
+              text: lines.join("\n"),
+              authority: 2.0,
+            });
+          }
+        } catch {
+          // Ignore dictionary fetch failures cleanly
+        }
+      })();
+
+      // 2. Wikipedia search + intro extract (preferring exact / broad concept pages over obscure proper nouns)
+      const wikiTask = (async () => {
+        try {
+          const normalizedLower = cleanSearchQuery.toLowerCase();
+          const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
+            cleanSearchQuery
+          )}&format=json&srlimit=5`;
+          const sRes = await fetch(searchUrl, {
+            signal: controller.signal,
+            headers: { "User-Agent": "NexoraAssistant/1.0" },
+          });
+          if (!sRes.ok) return;
+          const sData = (await sRes.json()) as {
+            query?: { search?: Array<{ title: string; snippet?: string }> };
+          };
+          const searchHits = sData.query?.search ?? [];
+          if (searchHits.length === 0) return;
+
+          // Filter out unrelated prefixed-article titles like "A Capital" when the user asked "what is a capital"
+          const scoredHits = searchHits
+            .filter((hit) => {
+              const tLower = hit.title.toLowerCase();
+              if (
+                normalizedLower.split(/\s+/).length === 1 &&
+                /^(a|an|the)\s+/.test(tLower) &&
+                tLower.replace(/^(a|an|the)\s+/, "") === normalizedLower &&
+                isDefinitionQuestion
+              ) {
+                return false;
+              }
+              return true;
+            })
+            .slice(0, 3);
+
+          const titlesToFetch = (scoredHits.length > 0 ? scoredHits : searchHits.slice(0, 2)).map(
+            (h) => h.title
+          );
+          if (titlesToFetch.length === 0) return;
+
+          const extractUrl = `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&redirects=1&titles=${encodeURIComponent(
+            titlesToFetch.join("|")
+          )}&format=json`;
+          const eRes = await fetch(extractUrl, {
+            signal: controller.signal,
+            headers: { "User-Agent": "NexoraAssistant/1.0" },
+          });
+          if (!eRes.ok) return;
+          const eData = (await eRes.json()) as {
+            query?: { pages?: Record<string, { title?: string; extract?: string }> };
+          };
+          for (const page of Object.values(eData.query?.pages ?? {})) {
+            const rawExtract = (page.extract || "").trim();
+            if (!page.title || rawExtract.length <= 40) continue;
+            // Skip sparse disambiguation stubs like "X may refer to:"
+            if (/^\S.{0,45}\bmay refer to:/i.test(rawExtract) && rawExtract.length < 280) {
+              continue;
+            }
+            const exactTitleMatch =
+              page.title.toLowerCase() === normalizedLower ||
+              page.title.toLowerCase().startsWith(`${normalizedLower} (`);
+            passages.push({
+              title: `${page.title} — Wikipedia`,
+              url: `https://en.wikipedia.org/wiki/${encodeURIComponent(
+                page.title.replace(/ /g, "_")
+              )}`,
+              text: rawExtract.slice(0, 4000),
+              authority: exactTitleMatch ? 1.65 : 1.25,
+            });
+          }
+        } catch {
+          // Ignore Wikipedia fetch failure
+        }
+      })();
+
+      // 3. Web search (skipped for single-word basic dictionary lookups unless needed, or lower weight)
+      const webTask = (async () => {
+        if (explicitUrls.length > 0 && cleanWords.length < 2) {
+          return;
+        }
+        try {
+          const hits = await searchWebInfo(cleanSearchQuery, controller.signal);
+          for (const hit of hits.slice(0, 5)) {
+            const text = hit.snippet.trim();
+            if (text.length <= 24) continue;
+            // Skip promotional company/VC fluff on broad term queries
+            if (
+              /\b(earliest backers|redefining luxury|branded residences|early-stage investing|high profile investments|partners at|holding\s*\|)\b/i.test(
+                `${hit.title} ${text}`
+              )
+            ) {
+              continue;
+            }
+            passages.push({
+              title: hit.title,
+              url: hit.url,
+              text,
+              authority: isDefinitionQuestion && cleanWords.length <= 2 ? 0.72 : 1.0,
+            });
+          }
+        } catch {
+          // Ignore search error
+        }
+      })();
+
+      await Promise.all([urlTask, dictTask, wikiTask, webTask]);
+      return res.json({ passages });
+    } finally {
+      clearTimeout(timeout);
+    }
+  });
+
+  // --- Bulk Web Corpus Harvester for Pure-TS Deep Neural Engine ---
+  app.post("/api/assistant/harvest-corpus", async (req: Request, res: Response) => {
+    const rawUrlInput = String(req.body?.url || "").trim();
+    const rawTopicInput = String(req.body?.topic || "").trim();
+    const maxPages = Math.max(2, Math.min(16, Number(req.body?.maxPages) || 12));
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 14_500);
+
+    type HarvestPage = { title: string; url: string; text: string };
+    const harvested: HarvestPage[] = [];
+    const seenUrls = new Set<string>();
+    const addPage = (page: HarvestPage) => {
+      if (!page.text || page.text.length < 120) return;
+      if (seenUrls.has(page.url)) return;
+      seenUrls.add(page.url);
+      harvested.push(page);
+    };
+
+    try {
+      let mode: "url_crawl" | "topic_harvest" | "broad_web_harvest" = "broad_web_harvest";
+
+      // Normalize bare domain URLs like "en.wikipedia.org/wiki/Python" if user omitted protocol
+      let normalizedUrl = rawUrlInput;
+      if (
+        normalizedUrl &&
+        !/^https?:\/\//i.test(normalizedUrl) &&
+        /^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/.*)?$/i.test(normalizedUrl)
+      ) {
+        normalizedUrl = `https://${normalizedUrl}`;
+      }
+      const explicitSafeUrl = normalizedUrl ? isSafeExternalUrl(normalizedUrl) : null;
+
+      if (explicitSafeUrl) {
+        mode = "url_crawl";
+        try {
+          const seed = await fetchRawHtmlAndProse(explicitSafeUrl.toString(), controller.signal, 32_000);
+          addPage({ title: seed.title, url: seed.url, text: seed.text });
+
+          const childLinks = extractSameOriginLinks(seed.html, seed.url, maxPages - 1);
+          const batch1 = childLinks.slice(0, 6);
+          const batch2 = childLinks.slice(6, maxPages - 1);
+
+          for (const batch of [batch1, batch2]) {
+            if (batch.length === 0 || controller.signal.aborted) break;
+            const settled = await Promise.allSettled(
+              batch.map((link) => fetchRawHtmlAndProse(link, controller.signal, 22_000))
+            );
+            for (const item of settled) {
+              if (item.status === "fulfilled") {
+                addPage({
+                  title: item.value.title,
+                  url: item.value.url,
+                  text: item.value.text,
+                });
+              }
+            }
+          }
+        } catch {
+          // Fall through to fallback search/wiki enrichment below if seed failed
+        }
+
+        // If site crawl yielded < 2 pages (e.g., JS-rendered SPA or strict bot wall), supplement from web search
+        if (harvested.length === 0 || harvested.reduce((a, p) => a + p.text.length, 0) < 1500) {
+          const hostQuery = explicitSafeUrl.hostname.replace(/^www\./, "");
+          const hits = await searchWebInfo(hostQuery, controller.signal);
+          const extraSettled = await Promise.allSettled(
+            hits
+              .slice(0, 4)
+              .map((h) => fetchRawHtmlAndProse(h.url, controller.signal, 20_000))
+          );
+          for (const item of extraSettled) {
+            if (item.status === "fulfilled") {
+              addPage({
+                title: item.value.title,
+                url: item.value.url,
+                text: item.value.text,
+              });
+            }
+          }
+        }
+      } else if (rawTopicInput.length >= 2) {
+        mode = "topic_harvest";
+        const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
+          rawTopicInput
+        )}&format=json&srlimit=10`;
+
+        const [wikiSearchRes, webHits] = await Promise.allSettled([
+          fetch(searchUrl, {
+            signal: controller.signal,
+            headers: { "User-Agent": "NexoraCorpusHarvester/1.0" },
+          }).then((r) => (r.ok ? r.json() : null)),
+          searchWebInfo(rawTopicInput, controller.signal),
+        ]);
+
+        const wikiTitles: string[] = [];
+        if (wikiSearchRes.status === "fulfilled" && wikiSearchRes.value) {
+          const items =
+            (wikiSearchRes.value as { query?: { search?: Array<{ title: string }> } }).query
+              ?.search ?? [];
+          for (const item of items.slice(0, 8)) {
+            wikiTitles.push(item.title);
+          }
+        }
+
+        const wikiBatches = [wikiTitles.slice(0, 4), wikiTitles.slice(4, 8)];
+        const extraUrls =
+          webHits.status === "fulfilled"
+            ? webHits.value
+                .map((h) => h.url)
+                .filter((u) => !u.includes("wikipedia.org"))
+                .slice(0, 4)
+            : [];
+
+        const [w1, w2, webPages] = await Promise.all([
+          fetchFullWikipediaBatch(wikiBatches[0], controller.signal, 24_000),
+          fetchFullWikipediaBatch(wikiBatches[1], controller.signal, 20_000),
+          Promise.allSettled(
+            extraUrls.map((u) => fetchRawHtmlAndProse(u, controller.signal, 20_000))
+          ),
+        ]);
+
+        for (const p of [...w1, ...w2]) addPage(p);
+        for (const item of webPages) {
+          if (item.status === "fulfilled") {
+            addPage({
+              title: item.value.title,
+              url: item.value.url,
+              text: item.value.text,
+            });
+          }
+        }
+      } else {
+        mode = "broad_web_harvest";
+        const coreKnowledgeBatches = [
+          [
+            "Artificial intelligence",
+            "Machine learning",
+            "Deep learning",
+            "Neural network (machine learning)",
+          ],
+          [
+            "Large language model",
+            "Transformer (deep learning architecture)",
+            "Python (programming language)",
+            "TypeScript",
+          ],
+          ["Algorithm", "World Wide Web", "Computer science", "Physics"],
+        ];
+
+        const webReferenceUrls = [
+          "https://www.python.org/about/",
+          "https://www.typescriptlang.org/docs/",
+          "https://developer.mozilla.org/en-US/docs/Web/HTML",
+        ];
+
+        const [b0, b1, b2, refPages] = await Promise.all([
+          fetchFullWikipediaBatch(coreKnowledgeBatches[0], controller.signal, 20_000),
+          fetchFullWikipediaBatch(coreKnowledgeBatches[1], controller.signal, 18_000),
+          fetchFullWikipediaBatch(coreKnowledgeBatches[2], controller.signal, 18_000),
+          Promise.allSettled(
+            webReferenceUrls.map((u) => fetchRawHtmlAndProse(u, controller.signal, 18_000))
+          ),
+        ]);
+
+        for (const p of [...b0, ...b1, ...b2]) addPage(p);
+        for (const item of refPages) {
+          if (item.status === "fulfilled") {
+            addPage({
+              title: item.value.title,
+              url: item.value.url,
+              text: item.value.text,
+            });
+          }
+        }
+      }
+
+      // Deduplicate and pack combined prose corpus cleanly (cap 220,000 chars)
+      const seenLineHashes = new Set<string>();
+      const combinedLines: string[] = [];
+      let totalChars = 0;
+      const sourceSummaries: Array<{
+        title: string;
+        url: string;
+        chars: number;
+        words: number;
+      }> = [];
+
+      for (const page of harvested) {
+        const pageLines: string[] = [];
+        for (const rawLine of page.text.split("\n")) {
+          const line = rawLine.trim();
+          if (line.length < 28) continue;
+          const hash = line.toLowerCase().slice(0, 72);
+          if (seenLineHashes.has(hash)) continue;
+          seenLineHashes.add(hash);
+          pageLines.push(line);
+        }
+        if (pageLines.length === 0) continue;
+
+        let acceptedChars = 0;
+        let acceptedWords = 0;
+        for (const line of pageLines) {
+          if (totalChars + line.length + 1 > 220_000) break;
+          combinedLines.push(line);
+          totalChars += line.length + 1;
+          acceptedChars += line.length;
+          acceptedWords += line.split(/\s+/).filter(Boolean).length;
+        }
+        if (acceptedChars > 0) {
+          sourceSummaries.push({
+            title: page.title,
+            url: page.url,
+            chars: acceptedChars,
+            words: acceptedWords,
+          });
+        }
+        if (totalChars >= 220_000) break;
+      }
+
+      const corpusText = combinedLines.join("\n");
+      const totalWords = corpusText.split(/\s+/).filter(Boolean).length;
+
+      return res.json({
+        mode,
+        corpusText,
+        sources: sourceSummaries,
+        totalChars: corpusText.length,
+        totalWords,
+        totalSentences: combinedLines.length,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
   });
 
   // --- Fetch available models from BYOK Base URL ---
@@ -1973,6 +2647,12 @@ async function startServer() {
       return res.json({ title: null });
     }
 
+    if (model === "Nexora Assistant" || model === "Nexora Nano (Local)") {
+      const words = prompt.replace(/[^\w\s-]/g, " ").trim().split(/\s+/).filter(Boolean);
+      const localTitle = words.slice(0, 5).join(" ").slice(0, 48) || null;
+      return res.json({ title: localTitle });
+    }
+
     const baseUrl = (effectiveByok.baseUrl || "").trim();
     const apiKey = (effectiveByok.apiKey || "").trim();
     const preset = (effectiveByok.preset || "").trim().toLowerCase();
@@ -1980,10 +2660,6 @@ async function startServer() {
       (effectiveByok.selectedModels?.[0] || "").trim() ||
       (effectiveByok.modelId || "").trim() ||
       getDefaultModelForPreset(preset);
-
-    const geminiServerKey = process.env.GEMINI_API_KEY?.trim() || "";
-    const hasServerGeminiKey =
-      Boolean(geminiServerKey) && geminiServerKey !== "MY_GEMINI_API_KEY";
 
     const titleSystemPrompt = `Create a short, natural conversation title in 2 to 5 words (${language}). Return ONLY the plain title text with no quotes, no markdown formatting, no prefixes like "Title:", and no trailing punctuation.`;
     const titleInput = [
@@ -2019,36 +2695,37 @@ async function startServer() {
         updatedAt: Date.now(),
       };
 
-      if (model === "Nexora Assistant" && hasServerGeminiKey && !apiKey) {
-        await runGeminiStream(
-          tempJob,
-          titleInput,
-          [],
-          [],
-          "gemini-4-hydrogen",
-          geminiServerKey,
-          titleSystemPrompt,
-          controller.signal,
-          appendDelta,
-          noopThought,
-          undefined,
-          undefined,
-          false
-        );
-      } else {
-        const targetModel =
-          model === "Nexora Assistant" || model === "Nexora Nano (Local)"
-            ? configuredByokModel || (hasServerGeminiKey ? "gemini-4-hydrogen" : "")
-            : model || configuredByokModel;
+      const targetModel = model || configuredByokModel;
 
-        if (!apiKey && hasServerGeminiKey) {
+      if (baseUrl && targetModel && (apiKey || baseUrl.includes("localhost") || baseUrl.includes("127.0.0.1"))) {
+        if (preset === "claude" || baseUrl.includes("anthropic.com")) {
+          await runAnthropicStream(
+            baseUrl,
+            apiKey,
+            targetModel,
+            "Low",
+            titleInput,
+            [],
+            [],
+            titleSystemPrompt,
+            controller.signal,
+            appendDelta,
+            noopThought
+          );
+        } else if (
+          preset === "gemini" ||
+          baseUrl.includes("generativelanguage.googleapis.com")
+        ) {
+          const cleanGeminiModel = targetModel
+            .replace(/^models\//, "")
+            .replace(/^gemini-2\.5-flash$/, "gemini-4-hydrogen");
           await runGeminiStream(
             tempJob,
             titleInput,
             [],
             [],
-            "gemini-4-hydrogen",
-            geminiServerKey,
+            cleanGeminiModel,
+            apiKey,
             titleSystemPrompt,
             controller.signal,
             appendDelta,
@@ -2057,63 +2734,25 @@ async function startServer() {
             undefined,
             false
           );
-        } else if (baseUrl && targetModel && (apiKey || baseUrl.includes("localhost") || baseUrl.includes("127.0.0.1"))) {
-          if (preset === "claude" || baseUrl.includes("anthropic.com")) {
-            await runAnthropicStream(
-              baseUrl,
-              apiKey,
-              targetModel,
-              "Low",
-              titleInput,
-              [],
-              [],
-              titleSystemPrompt,
-              controller.signal,
-              appendDelta,
-              noopThought
-            );
-          } else if (
-            preset === "gemini" ||
-            baseUrl.includes("generativelanguage.googleapis.com")
-          ) {
-            const cleanGeminiModel = targetModel
-              .replace(/^models\//, "")
-              .replace(/^gemini-2\.5-flash$/, "gemini-4-hydrogen");
-            await runGeminiStream(
-              tempJob,
-              titleInput,
-              [],
-              [],
-              cleanGeminiModel,
-              apiKey,
-              titleSystemPrompt,
-              controller.signal,
-              appendDelta,
-              noopThought,
-              undefined,
-              undefined,
-              false
-            );
-          } else {
-            const extraHeaders: Record<string, string> =
-              preset === "openrouter" || baseUrl.includes("openrouter.ai")
-                ? { "X-Title": "Nexora" }
-                : {};
-            await runOpenAICompatibleStream(
-              baseUrl,
-              apiKey,
-              targetModel,
-              "Low",
-              titleInput,
-              [],
-              [],
-              extraHeaders,
-              titleSystemPrompt,
-              controller.signal,
-              appendDelta,
-              noopThought
-            );
-          }
+        } else {
+          const extraHeaders: Record<string, string> =
+            preset === "openrouter" || baseUrl.includes("openrouter.ai")
+              ? { "X-Title": "Nexora" }
+              : {};
+          await runOpenAICompatibleStream(
+            baseUrl,
+            apiKey,
+            targetModel,
+            "Low",
+            titleInput,
+            [],
+            [],
+            extraHeaders,
+            titleSystemPrompt,
+            controller.signal,
+            appendDelta,
+            noopThought
+          );
         }
       }
 

@@ -97,6 +97,20 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidMemory(data, userId, memoryId) {
+      return data.keys().hasAll(['id', 'ownerId', 'category', 'key', 'value', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerId', 'category', 'key', 'value', 'sourceThreadId', 'sourceThreadTitle', 'createdAt', 'updatedAt'])
+        && data.id is string && data.id == memoryId && isValidId(data.id)
+        && data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId)
+        && data.category is string && (data.category == 'identity' || data.category == 'preference' || data.category == 'project' || data.category == 'fact')
+        && data.key is string && data.key.size() >= 1 && data.key.size() <= 80
+        && data.value is string && data.value.size() >= 1 && data.value.size() <= 400
+        && (!data.keys().hasAny(['sourceThreadId']) || data.sourceThreadId == null || (data.sourceThreadId is string && isValidId(data.sourceThreadId)))
+        && (!data.keys().hasAny(['sourceThreadTitle']) || data.sourceThreadTitle == null || (data.sourceThreadTitle is string && data.sourceThreadTitle.size() <= 160))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     function isValidMessage(data, userId, threadId, messageId) {
       return data.keys().hasAll(['id', 'ownerId', 'threadId', 'orderIndex', 'role', 'content', 'timestamp', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly([
@@ -233,6 +247,25 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'updatedAt']);
       allow delete: if isValidId(userId) && isValidId(folderId) && isOwner(userId);
+    }
+
+    match /users/{userId}/memories/{memoryId} {
+      allow get: if isValidId(userId) && isValidId(memoryId) && isOwner(userId);
+      allow list: if isValidId(userId) && isOwner(userId) && resource.data.ownerId == request.auth.uid;
+      allow create: if isValidId(userId) && isValidId(memoryId)
+        && isOwner(userId)
+        && isValidMemory(incoming(), userId, memoryId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId) && isValidId(memoryId)
+        && isOwner(userId)
+        && isValidMemory(incoming(), userId, memoryId)
+        && incoming().id == existing().id
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['category', 'key', 'value', 'sourceThreadId', 'sourceThreadTitle', 'updatedAt']);
+      allow delete: if isValidId(userId) && isValidId(memoryId) && isOwner(userId);
     }
   }
 }

@@ -21,9 +21,14 @@ import {
   BYOK_PRESETS,
   DEFAULT_BYOK,
   type ByokConfig,
+  type LocalModelTier,
   type SavedByokModel,
   type WorkspaceSettingsSnapshot,
 } from "../lib/offlineStore";
+import {
+  getLocalModelPreset,
+  LOCAL_MODEL_PRESETS,
+} from "../lib/localWebGpuEngine";
 import type { SidebarAccount } from "./SidebarNav";
 
 export type SettingsTab =
@@ -734,8 +739,8 @@ export default function SettingsView({
               <div className="flex flex-col gap-7">
                 <SettingsSection title="Built-in Assistant">
                   <SettingsRow
-                    title="Nexora Assistant · Generic"
-                    description="Built-in workspace assistant handled by the Nexora server."
+                    title="Nexora Assistant · Built-in"
+                    description="Standalone pure-TypeScript assistant (Micrograd, Attention, MatMul & math). Never connects to external providers."
                   >
                     <span className="inline-flex h-8 items-center rounded-[9px] border border-line-strong/80 bg-surface px-3 text-[12px] font-medium text-ink-2 shadow-xs">
                       Default
@@ -1363,10 +1368,10 @@ export default function SettingsView({
 
             {activeTab === "beta" && (
               <div className="flex flex-col gap-7">
-                <SettingsSection title="On-Device AI">
+                <SettingsSection title="On-Device AI (Zero External API)">
                   <SettingsRow
                     title="Local AI model (WebGPU)"
-                    description="Run an on-device ~300 MB quantized model directly in your browser using WebGPU (works offline)."
+                    description="Run on-device Qwen 3.5 / Qwen 3 quantized weights directly on your GPU via WebGPU — no API keys, no rate limits, and upgrades Nexora Assistant beyond Qwen 2.5."
                   >
                     <SettingToggle
                       checked={settings.localModelEnabled}
@@ -1383,10 +1388,38 @@ export default function SettingsView({
                       <div className="flex flex-wrap items-center justify-between gap-3">
                         <div className="min-w-0 flex-1">
                           <div className="text-[13.5px] font-medium text-ink">
-                            SmolLM2 360M (4-bit quantized WebGPU)
+                            On-device model tier
                           </div>
-                          <div className="mt-0.5 text-[12.5px] tabular-nums text-ink-2">
-                            ~300 MB weights ·{" "}
+                          <div className="mt-0.5 text-[12.5px] text-ink-2">
+                            {getLocalModelPreset(settings.localModelTier).description}
+                          </div>
+                        </div>
+
+                        <SettingsSelect
+                          ariaLabel="Local WebGPU model tier"
+                          value={getLocalModelPreset(settings.localModelTier).tier}
+                          onChange={(next) => {
+                            if (localModelStatus === "downloading") return;
+                            onUpdateSettings({
+                              localModelTier: next as LocalModelTier,
+                            });
+                          }}
+                        >
+                          {LOCAL_MODEL_PRESETS.map((preset) => (
+                            <option key={preset.tier} value={preset.tier}>
+                              {preset.label} · {preset.sizeLabel}
+                            </option>
+                          ))}
+                        </SettingsSelect>
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-between gap-3 rounded-[10px] border border-line/70 bg-surface px-3.5 py-2.5">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-[13px] font-medium text-ink">
+                            {getLocalModelPreset(settings.localModelTier).shortLabel} (4-bit WebGPU)
+                          </div>
+                          <div className="mt-0.5 text-[12px] tabular-nums text-ink-2">
+                            {getLocalModelPreset(settings.localModelTier).sizeLabel} weights ·{" "}
                             {hasWebGpu
                               ? "WebGPU API detected"
                               : "WebGPU not supported in this browser"}
@@ -1399,7 +1432,7 @@ export default function SettingsView({
                             onClick={onDownloadLocalModel}
                             className="h-9 shrink-0 whitespace-nowrap rounded-[10px] bg-ink px-3.5 text-[12.5px] font-medium text-surface transition-opacity hover:opacity-90"
                           >
-                            Download (~300 MB)
+                            Download ({getLocalModelPreset(settings.localModelTier).sizeLabel})
                           </button>
                         )}
 
@@ -1435,7 +1468,7 @@ export default function SettingsView({
                         <div className="flex flex-col gap-1.5">
                           <div className="flex items-center justify-between gap-2 text-[12px] tabular-nums text-ink-2">
                             <span className="truncate">
-                              {localStatusText || "Downloading & compiling WebGPU shaders…"}
+                              {localStatusText || `Downloading ${getLocalModelPreset(settings.localModelTier).shortLabel} & compiling WebGPU shaders…`}
                             </span>
                             <span className="shrink-0">{localDownloadProgress}%</span>
                           </div>
@@ -1451,9 +1484,9 @@ export default function SettingsView({
                       {localModelStatus === "ready" && (
                         <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                           <div className="text-[12.5px] text-ink-2">
-                            Cached on device · Active as{" "}
-                            <span className="font-medium text-ink">Nexora Nano (Local)</span> in the
-                            composer
+                            Cached on device · Powers{" "}
+                            <span className="font-medium text-ink">Nexora Assistant</span> &{" "}
+                            <span className="font-medium text-ink">Nexora Nano (Local)</span>
                           </div>
 
                           <SettingsSelect

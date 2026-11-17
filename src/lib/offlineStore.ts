@@ -1,4 +1,5 @@
 import type { ChatFolder, WorkspaceThread } from "../data/workspaceThreads";
+import type { ChatMemoryFact } from "./chatMemory";
 
 const DB_NAME = "nexora_offline_db";
 const DB_VERSION = 1;
@@ -92,6 +93,13 @@ export interface ByokConfig {
   savedModels?: SavedByokModel[];
 }
 
+export type LocalModelTier =
+  | "qwen3.5-4b"
+  | "qwen3.5-2b"
+  | "qwen3-1.7b"
+  | "qwen3.5-0.8b"
+  | "smollm2-360m";
+
 export interface WorkspaceSettingsSnapshot {
   isDark: boolean;
   sendOnEnter: boolean;
@@ -111,6 +119,7 @@ export interface WorkspaceSettingsSnapshot {
   localModelEnabled: boolean;
   localModelReady: boolean;
   localBackend: "webgpu" | "cpu";
+  localModelTier: LocalModelTier;
 }
 
 export const DEFAULT_SETTINGS: WorkspaceSettingsSnapshot = {
@@ -133,6 +142,7 @@ export const DEFAULT_SETTINGS: WorkspaceSettingsSnapshot = {
   localModelReady: false,
   localBackend:
     typeof navigator !== "undefined" && "gpu" in navigator ? "webgpu" : "cpu",
+  localModelTier: "qwen3.5-2b",
 };
 
 export const DEFAULT_BYOK: ByokConfig = {
@@ -306,6 +316,30 @@ export async function loadOfflineFolders(): Promise<ChatFolder[]> {
 
 export async function saveOfflineFolders(folders: ChatFolder[]): Promise<void> {
   await idbSet("folders", folders);
+}
+
+export function loadLocalMemoriesSync(): ChatMemoryFact[] {
+  try {
+    const raw = localStorage.getItem("nexora:memories");
+    const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+    return Array.isArray(parsed) ? (parsed as ChatMemoryFact[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveLocalMemoriesSync(memories: ChatMemoryFact[]): void {
+  writeLocalStorageSafely("memories", memories);
+}
+
+export async function loadOfflineMemories(): Promise<ChatMemoryFact[]> {
+  const fromIdb = await idbGet<ChatMemoryFact[]>("memories");
+  if (Array.isArray(fromIdb) && fromIdb.length > 0) return fromIdb;
+  return loadLocalMemoriesSync();
+}
+
+export async function saveOfflineMemories(memories: ChatMemoryFact[]): Promise<void> {
+  await idbSet("memories", memories);
 }
 
 export async function loadOfflineSettings(): Promise<WorkspaceSettingsSnapshot> {
@@ -486,7 +520,19 @@ export function saveByokConfig(byok: ByokConfig): void {
 }
 
 export function resolveByokForModel(byok: ByokConfig, model: string): ByokConfig {
-  const matched = (byok.savedModels ?? []).find((m) => m.id === model);
+  const cleanModel = model.trim();
+  if (cleanModel === "Nexora Assistant" || cleanModel === "Nexora Nano (Local)") {
+    return {
+      preset: "custom",
+      baseUrl: "",
+      apiKey: "",
+      modelId: "",
+      selectedModels: [],
+      fetchedModels: [],
+      savedModels: [],
+    };
+  }
+  const matched = (byok.savedModels ?? []).find((m) => m.id === cleanModel);
   if (!matched) return byok;
   return {
     ...byok,

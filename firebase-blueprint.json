@@ -217,6 +217,53 @@
         }
       },
       "required": ["id", "ownerId", "threadId", "orderIndex", "role", "content", "timestamp", "createdAt", "updatedAt"]
+    },
+    "UserMemoryDoc": {
+      "title": "UserMemoryDoc",
+      "description": "Persistent cross-chat AI memory fact or preference owned by an authenticated user",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "category": {
+          "type": "string",
+          "enum": ["identity", "preference", "project", "fact"]
+        },
+        "key": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "value": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "sourceThreadId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "sourceThreadTitle": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "ownerId", "category", "key", "value", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -235,6 +282,10 @@
     "/users/{userId}/folders/{folderId}": {
       "schema": { "$ref": "#/entities/ChatFolderDoc" },
       "description": "User chat organization folders"
+    },
+    "/users/{userId}/memories/{memoryId}": {
+      "schema": { "$ref": "#/entities/UserMemoryDoc" },
+      "description": "Persistent cross-chat memory facts and preferences owned by the user"
     },
     "/users/{userId}/threads/{threadId}/messages/{messageId}": {
       "schema": { "$ref": "#/entities/ChatMessageDoc" },

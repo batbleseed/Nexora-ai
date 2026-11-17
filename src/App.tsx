@@ -4,6 +4,7 @@ import { onAuthStateChanged, type User as FirebaseUser } from "firebase/auth";
 import CodeBlock, { WorkspaceStageContext } from "./components/CodeBlock";
 import InlineHtmlPreview from "./components/InlineHtmlPreview";
 import MarkdownRenderer from "./components/MarkdownRenderer";
+import NeuralEngineLab, { type NeuralLabTab } from "./components/NeuralEngineLab";
 import {
   IconMagnifyingGlass,
   IconSidebarLeftArrow,
@@ -27,10 +28,13 @@ import ThinkingState from "./components/ThinkingState";
 import { useOnlineStatus } from "./hooks/useOnlineStatus";
 import {
   auth,
+  deleteAllFirebaseMemories,
   deleteAllFirebaseThreads,
   deleteFirebaseFolder,
+  deleteFirebaseMemory,
   deleteFirebaseThread,
   loadFirebaseFolders,
+  loadFirebaseMemories,
   loadFirebasePreferences,
   loadFirebaseThreads,
   makeInitials,
@@ -38,17 +42,27 @@ import {
   signInWithGooglePopup,
   signOutFirebase,
   syncFolderToFirestore,
+  syncMemoryToFirestore,
   syncThreadToFirestore,
   upsertFirebaseUserProfile,
 } from "./lib/firebase";
+import {
+  applyMemoryExtraction,
+  buildThreadMemoryDigests,
+  extractMemoriesFromMessage,
+  mergeMemoryFacts,
+  type ChatMemoryFact,
+} from "./lib/chatMemory";
 import {
   getOrCreateGuestWorkspaceId,
   loadAuthSession,
   loadByokConfig,
   loadLocalFoldersSync,
+  loadLocalMemoriesSync,
   loadLocalSettingsSync,
   loadLocalThreadsSync,
   loadOfflineFolders,
+  loadOfflineMemories,
   loadOfflineSettings,
   loadOfflineThreads,
   loadPendingJobs,
@@ -57,9 +71,11 @@ import {
   saveAuthSession,
   saveByokConfig,
   saveLocalFoldersSync,
+  saveLocalMemoriesSync,
   saveLocalSettingsSync,
   saveLocalThreadsSync,
   saveOfflineFolders,
+  saveOfflineMemories,
   saveOfflineSettings,
   saveOfflineThreads,
   savePendingJobs,
@@ -81,9 +97,14 @@ import {
 import {
   clearLocalModelCache,
   ensureLocalEngineLoaded,
+  getLocalModelPreset,
   isAnyLocalModelCached,
   streamLocalWebGpuChat,
 } from "./lib/localWebGpuEngine";
+import {
+  runNexoraBuiltInAssistant,
+  streamNexoraBuiltInAssistant,
+} from "./lib/nexoraBuiltInEngine";
 
 const DEFAULT_MODELS = ["Nexora Assistant"];
 
@@ -210,6 +231,10 @@ function toReadableSpeechText(markdown: string): string {
       /```(?:nexora-preview|html-preview|preview|widget)[\s\S]*?```/gi,
       " Interactive visual omitted. "
     )
+    .replace(
+      /```(?:nexora-lab|neural-lab|engine-lab)[\s\S]*?```/gi,
+      " Interactive neural engine lab omitted. "
+    )
     .replace(/```[\s\S]*?```/g, " Code block omitted. ")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
@@ -293,7 +318,8 @@ function readFileAsAttachmentPayload(
 type ResponseSegment =
   | { type: "text"; content: string }
   | { type: "code"; filename: string; lines: string[] }
-  | { type: "preview"; html: string; isLoading?: boolean };
+  | { type: "preview"; html: string; isLoading?: boolean }
+  | { type: "lab"; tab: NeuralLabTab };
 
 const PREVIEW_FENCE_LANGS = new Set([
   "nexora-preview",
@@ -302,8 +328,118 @@ const PREVIEW_FENCE_LANGS = new Set([
   "widget",
 ]);
 
+const LAB_FENCE_LANGS = new Set(["nexora-lab", "neural-lab", "engine-lab"]);
+
 function isPreviewFenceLang(lang: string): boolean {
   return PREVIEW_FENCE_LANGS.has(lang.trim().toLowerCase());
+}
+
+function isLabFenceLang(lang: string): boolean {
+  return LAB_FENCE_LANGS.has(lang.trim().toLowerCase());
+}
+
+function parseNeuralLabTab(body: string): NeuralLabTab {
+  const clean = body.trim().toLowerCase();
+  if (
+    clean.includes("pipeline") ||
+    clean.includes("deep ai") ||
+    clean.includes("deep learning") ||
+    clean.includes("how ai learns")
+  ) {
+    return "pipeline";
+  }
+  if (clean.includes("attention") || clean.includes("transformer")) {
+    return "attention";
+  }
+  if (clean.includes("matmul") || clean.includes("matrix")) {
+    return "matmul";
+  }
+  return "micrograd";
+}
+
+function detectInstantLabTab(
+  prompt: string,
+  includeNaturalKeywords: boolean
+): NeuralLabTab | null {
+  const clean = prompt.trim().toLowerCase();
+  if (/^\/(pipeline|train|lm|deep)\b/.test(clean)) return "pipeline";
+  if (/^\/(micrograd|backprop|autograd)\b/.test(clean)) return "micrograd";
+  if (/^\/(attention|transformer|self-attention)\b/.test(clean)) return "attention";
+  if (/^\/(matmul|matrix)\b/.test(clean)) return "matmul";
+  if (/^\/lab\b/.test(clean)) return parseNeuralLabTab(clean);
+
+  if (includeNaturalKeywords) {
+    if (
+      /(deep learning|how ai learns|data.*training.*adjustment.*inference|weights and biases|next[- ]token)/.test(
+        clean
+      )
+    ) {
+      return "pipeline";
+    }
+    if (/(micrograd|backprop|autograd|chain rule|mlp|xor)/.test(clean)) {
+      return "micrograd";
+    }
+    if (/(transformer|self-attention|scaled dot|softmax|qkv|layernorm)/.test(clean)) {
+      return "attention";
+    }
+    if (/(matrix mult|matmul|dot product|row.*col)/.test(clean)) {
+      return "matmul";
+    }
+  }
+  return null;
+}
+
+function buildLocalNeuralLabMarkdown(tab: NeuralLabTab): string {
+  if (tab === "pipeline") {
+    return [
+      "### TensorFlow.js Deep AI Pipeline (Data → `model.fit()` → Adjustment → `model.predict()`)",
+      "",
+      "Powered by **TensorFlow.js (`@tensorflow/tfjs`)** (`src/lib/neuralLanguageEngine.ts`). Converts raw text or crawled websites into integer token sequences, builds a multi-layer `tf.sequential()` neural network (`Embedding → Flatten → Dense(tanh) → Dropout → Dense(relu) → Softmax`), trains live with **`await model.fit()`** using **`tf.train.adam`** or **`tf.train.sgd`**, and runs real-time `model.predict()` inference.",
+      "",
+      "```nexora-lab",
+      "pipeline",
+      "```",
+      "",
+      "Edit or harvest web data above, pick `tf.train.adam` or `tf.train.sgd`, click **`model.fit(20)`** to watch loss fall and accuracy climb, and test **Inference** with any prompt starter.",
+    ].join("\n");
+  }
+  if (tab === "attention") {
+    return [
+      "### Pure TypeScript Transformer & Self-Attention Lab",
+      "",
+      "Built with **zero external libraries** (`src/lib/transformerEngine.ts`). Every matrix multiply, transpose, `1/√d_k` scaling, causal mask, row-wise softmax, LayerNorm, and GELU feed-forward step runs live in pure TypeScript.",
+      "",
+      "```nexora-lab",
+      "attention",
+      "```",
+      "",
+      "Try editing the tokens, toggling **Causal Mask**, or switching `d_k` to see how query-key dot products redistribute attention weights.",
+    ].join("\n");
+  }
+  if (tab === "matmul") {
+    return [
+      "### Pure TypeScript Matrix Multiplication Lab",
+      "",
+      "Built with **zero external libraries** (`src/lib/transformerEngine.ts`). Click or hover any output cell `C[i, j]` below to trace the exact row-by-column dot product `(A[i, 0] × B[0, j]) + ...`.",
+      "",
+      "```nexora-lab",
+      "matmul",
+      "```",
+      "",
+      "Switch tabs at the top of the lab anytime to inspect **Micrograd Backprop** or **Transformer Attention**.",
+    ].join("\n");
+  }
+  return [
+    "### Pure TypeScript Micrograd & Backpropagation Lab",
+    "",
+    "Built with **zero external libraries** (`src/lib/microgradEngine.ts`). Each `Value` node records its forward `data`, child parents `_prev`, local derivative closure `_backward()`, and accumulated gradient `.grad` computed via reverse topological traversal.",
+    "",
+    "```nexora-lab",
+    "micrograd",
+    "```",
+    "",
+    "Adjust any weight/input slider or click **Step SGD (-0.25·grad)** to watch loss drop, or switch to **XOR MLP Trainer** to train a `2 → 4 → 1` network from scratch.",
+  ].join("\n");
 }
 
 function langToFilename(lang: string): string {
@@ -336,6 +472,8 @@ function splitMarkdownSegments(markdown: string, isStreaming: boolean): Response
       if (body.trim()) {
         segments.push({ type: "preview", html: body });
       }
+    } else if (isLabFenceLang(lang)) {
+      segments.push({ type: "lab", tab: parseNeuralLabTab(body) });
     } else {
       segments.push({
         type: "code",
@@ -359,6 +497,8 @@ function splitMarkdownSegments(markdown: string, isStreaming: boolean): Response
         const partialCode = afterBackticks.slice(newlineIdx + 1);
         if (isPreviewFenceLang(lang)) {
           segments.push({ type: "preview", html: "", isLoading: true });
+        } else if (isLabFenceLang(lang)) {
+          segments.push({ type: "lab", tab: parseNeuralLabTab(partialCode) });
         } else {
           segments.push({
             type: "code",
@@ -377,6 +517,8 @@ function splitMarkdownSegments(markdown: string, isStreaming: boolean): Response
         const body = afterBackticks.slice(newlineIdx + 1).trim();
         if (isPreviewFenceLang(lang) && body) {
           segments.push({ type: "preview", html: body });
+        } else if (isLabFenceLang(lang)) {
+          segments.push({ type: "lab", tab: parseNeuralLabTab(body) });
         } else {
           segments.push({ type: "text", content: tail.slice(openFenceIdx).trim() });
         }
@@ -594,6 +736,10 @@ function AssistantMessageBlock({
             isDark={isDark}
             isLoading={seg.isLoading}
           />
+        ) : seg.type === "lab" ? (
+          <div key={`lab-${idx}`} className="w-full">
+            <NeuralEngineLab initialTab={seg.tab} />
+          </div>
         ) : seg.type === "code" ? (
           <div key={`code-${idx}`} className="w-full">
             <CodeBlock
@@ -708,6 +854,7 @@ export default function App() {
   const [byok, setByok] = useState<ByokConfig>(() => loadByokConfig());
   const [threads, setThreads] = useState<WorkspaceThread[]>(() => loadLocalThreadsSync());
   const [folders, setFolders] = useState<ChatFolder[]>(() => loadLocalFoldersSync());
+  const [memoryFacts, setMemoryFacts] = useState<ChatMemoryFact[]>(() => loadLocalMemoriesSync());
   const [activeThreadId, setActiveThreadId] = useState<string | null>(
     () => initialUi?.activeThreadId ?? null
   );
@@ -791,6 +938,8 @@ export default function App() {
   threadsRef.current = threads;
   const foldersRef = useRef(folders);
   foldersRef.current = folders;
+  const memoryFactsRef = useRef(memoryFacts);
+  memoryFactsRef.current = memoryFacts;
   const desktopSidebarCollapsedRef = useRef(sidebarCollapsed);
   if (!isMobile) {
     desktopSidebarCollapsedRef.current = sidebarCollapsed;
@@ -836,6 +985,7 @@ export default function App() {
     const flushAllToLocalStorage = () => {
       saveLocalThreadsSync(threadsRef.current);
       saveLocalFoldersSync(foldersRef.current);
+      saveLocalMemoriesSync(memoryFactsRef.current);
       saveLocalSettingsSync(settingsRef.current);
       saveUiSession(uiSessionRef.current);
     };
@@ -1208,16 +1358,19 @@ export default function App() {
         // Pull Cloud Firestore snapshot if signed in with verified Firebase account
         let firestoreThreads: WorkspaceThread[] = [];
         let firestoreFolders: ChatFolder[] = [];
+        let firestoreMemories: ChatMemoryFact[] = [];
         let firestorePrefs: Partial<WorkspaceSettingsSnapshot> | null = null;
         if (activeFb && activeFb.emailVerified) {
           try {
-            const [fsThreads, fsFolders, fsPrefs] = await Promise.all([
+            const [fsThreads, fsFolders, fsMemories, fsPrefs] = await Promise.all([
               loadFirebaseThreads(activeFb.uid),
               loadFirebaseFolders(activeFb.uid),
+              loadFirebaseMemories(activeFb.uid),
               loadFirebasePreferences(activeFb.uid),
             ]);
             firestoreThreads = fsThreads;
             firestoreFolders = fsFolders;
+            firestoreMemories = fsMemories;
             firestorePrefs = fsPrefs;
           } catch (err) {
             console.error("Firestore read error:", err);
@@ -1235,10 +1388,24 @@ export default function App() {
           });
         }
 
-        const [localCachedThreads, localCachedFolders] = await Promise.all([
+        const [localCachedThreads, localCachedFolders, localCachedMemories] = await Promise.all([
           loadOfflineThreads(),
           loadOfflineFolders(),
+          loadOfflineMemories(),
         ]);
+
+        const mergedMemories = mergeMemoryFacts(localCachedMemories, firestoreMemories);
+        setMemoryFacts(mergedMemories);
+        saveLocalMemoriesSync(mergedMemories);
+        void saveOfflineMemories(mergedMemories);
+        if (activeFb && activeFb.emailVerified) {
+          const fsMemIds = new Set(firestoreMemories.map((m) => m.id));
+          for (const m of mergedMemories) {
+            if (!fsMemIds.has(m.id)) {
+              void syncMemoryToFirestore(activeFb.uid, m).catch(() => {});
+            }
+          }
+        }
 
         // Merge folders across local cache, Firestore, and built-in server
         const foldersById = new Map<string, ChatFolder>();
@@ -1466,9 +1633,10 @@ export default function App() {
     let cancelled = false;
 
     const boot = async () => {
-      const [cachedThreads, cachedFolders, cachedSettings] = await Promise.all([
+      const [cachedThreads, cachedFolders, cachedMemories, cachedSettings] = await Promise.all([
         loadOfflineThreads(),
         loadOfflineFolders(),
+        loadOfflineMemories(),
         loadOfflineSettings(),
       ]);
       if (cancelled) return;
@@ -1477,21 +1645,15 @@ export default function App() {
       saveLocalThreadsSync(cachedThreads);
       setFolders(cachedFolders);
       saveLocalFoldersSync(cachedFolders);
+      setMemoryFacts(cachedMemories);
+      saveLocalMemoriesSync(cachedMemories);
       setSettings(cachedSettings);
       saveLocalSettingsSync(cachedSettings);
       if (cachedSettings.localModelReady) {
-        const cachedOk = await isAnyLocalModelCached();
+        const cachedOk = await isAnyLocalModelCached(cachedSettings.localModelTier);
         if (!cancelled && cachedOk) {
           setLocalModelStatus("ready");
           setLocalDownloadProgress(100);
-          const currentByok = loadByokConfig();
-          if (
-            !loadUiSession()?.selectedComposerModel &&
-            !currentByok.apiKey.trim() &&
-            (currentByok.savedModels?.length ?? 0) === 0
-          ) {
-            setSelectedComposerModel("Nexora Nano (Local)");
-          }
         } else if (!cancelled) {
           setLocalModelStatus("idle");
           setLocalDownloadProgress(0);
@@ -1595,22 +1757,40 @@ export default function App() {
     });
   }, []);
 
+  useEffect(() => {
+    if (!settings.localModelEnabled) return;
+    let cancelled = false;
+    void isAnyLocalModelCached(settings.localModelTier).then((cached) => {
+      if (cancelled) return;
+      setLocalModelStatus((curr) => {
+        if (curr === "downloading") return curr;
+        return cached ? "ready" : "idle";
+      });
+      if (cached) {
+        setLocalDownloadProgress(100);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [settings.localModelEnabled, settings.localModelTier]);
+
   const handleDownloadLocalModel = () => {
     if (localModelStatus === "downloading" || localModelStatus === "ready") return;
+    const preset = getLocalModelPreset(settings.localModelTier);
     setLocalError(null);
-    setLocalStatusText("Checking WebGPU support…");
+    setLocalStatusText(`Checking WebGPU support for ${preset.shortLabel}…`);
     setLocalModelStatus("downloading");
     setLocalDownloadProgress(2);
 
-    void ensureLocalEngineLoaded(({ progress, text }) => {
+    void ensureLocalEngineLoaded(settings.localModelTier, ({ progress, text }) => {
       setLocalDownloadProgress(Math.max(2, progress));
       setLocalStatusText(text);
     })
       .then(() => {
         setLocalDownloadProgress(100);
-        setLocalStatusText("WebGPU model cached and ready.");
+        setLocalStatusText(`${preset.shortLabel} cached and ready on WebGPU.`);
         setLocalModelStatus("ready");
-        setSelectedComposerModel("Nexora Nano (Local)");
         handleUpdateSettings({ localModelReady: true, localModelEnabled: true });
       })
       .catch((err) => {
@@ -1825,6 +2005,7 @@ export default function App() {
       model: string
     ) => {
       if (typeof navigator !== "undefined" && !navigator.onLine) return;
+      if (model === "Nexora Assistant" || model === "Nexora Nano (Local)") return;
       if (!prompt.trim() && !assistantText.trim()) return;
       try {
         const res = await fetch("/api/chat/title", {
@@ -2413,7 +2594,7 @@ export default function App() {
 
   const appendMessagePair = async (
     promptText: string,
-    meta: { model: string; effort: string; attachments: File[] }
+    meta: { model: string; effort: string; attachments: File[]; forceLabTab?: NeuralLabTab }
   ) => {
     const trimmed = promptText.trim();
     const timestamp = formatNowTime(settings.language);
@@ -2440,62 +2621,139 @@ export default function App() {
       attachmentPreviews,
     };
 
+    const isBuiltInAssistant = meta.model === "Nexora Assistant";
+    const hasWebGpuReady =
+      settings.localModelEnabled && localModelStatus === "ready";
+    const hasSavedByokModels = composerModels.some(
+      (m) => m !== "Nexora Assistant" && m !== "Nexora Nano (Local)"
+    );
+
+    const builtInHistory = (activeThread?.messages ?? [])
+      .filter((m) => m.content.trim() && m.jobStatus !== "error")
+      .slice(-24)
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+
+    const builtInForcedTab = meta.forceLabTab;
+    const useBuiltInStream = isBuiltInAssistant && !builtInForcedTab;
+
     const useWebGpuLocal =
       meta.model === "Nexora Nano (Local)" ||
-      (!isOnline && settings.localModelEnabled && localModelStatus === "ready");
-    const isOfflineWithoutLocal = !isOnline && !useWebGpuLocal;
+      (!isOnline && !isBuiltInAssistant && hasWebGpuReady);
 
-    const assistantMsg: WorkspaceMessage = isOfflineWithoutLocal
+    const isOfflineWithoutLocal = !isOnline && !useWebGpuLocal && !isBuiltInAssistant;
+
+    const instantLabTab =
+      !useBuiltInStream && meta.attachments.length === 0
+        ? builtInForcedTab ?? detectInstantLabTab(trimmed, !isOnline)
+        : null;
+
+    const isLocalServed = Boolean(instantLabTab) || isOfflineWithoutLocal;
+
+    const assistantMsg: WorkspaceMessage = instantLabTab
       ? {
           id: assistantMsgId,
           role: "assistant",
-          content: runOfflineLocalAssistant(trimmed, {
-            isLocalWebGpuReady:
-              settings.localModelEnabled && localModelStatus === "ready",
-            backend: settings.localBackend,
-          }),
-          model: meta.model,
+          content: buildLocalNeuralLabMarkdown(instantLabTab),
+          model: isBuiltInAssistant
+            ? "Nexora Assistant · Pure-TS Engine"
+            : `${meta.model} · Pure-TS Engine`,
           effort: meta.effort,
           timestamp,
           thinkingVariant: "Steps",
-          thinkingLines: ["Served from offline workspace cache"],
+          thinkingLines: [
+            "Initialized zero-dependency TypeScript engine",
+            instantLabTab === "micrograd"
+              ? "Loaded Value autograd DAG & XOR MLP trainer"
+              : instantLabTab === "attention"
+                ? "Loaded Scaled Dot-Product Attention & FFN pass"
+                : "Loaded Matrix Multiplication dot-product tracer",
+          ],
           jobStatus: "completed",
         }
-      : useWebGpuLocal
+      : useBuiltInStream
         ? {
             id: assistantMsgId,
             role: "assistant",
             content: "",
-            model: "Nexora Nano (Local)",
+            model:
+              hasWebGpuReady && settings.localModelTier !== "smollm2-360m"
+                ? `Nexora Assistant · ${getLocalModelPreset(settings.localModelTier).shortLabel}`
+                : "Nexora Assistant · Pure-TS Engine",
             effort: meta.effort,
             timestamp,
-            thinkingVariant: "Steps",
-            thinkingLines: ["Running on-device WebGPU (SmolLM2 360M)"],
+            thinkingVariant: "Reasoning",
+            thinkingLines: [
+              hasWebGpuReady && settings.localModelTier !== "smollm2-360m"
+                ? `Running Pure-TS + ${getLocalModelPreset(settings.localModelTier).shortLabel}`
+                : "Running Nexora Pure-TS Engine",
+            ],
             reasoningText: "",
             thinkingDurationMs: 0,
             jobStatus: "running",
           }
-        : {
-            id: assistantMsgId,
-            role: "assistant",
-            content: "",
-            model: meta.model,
-            effort: meta.effort,
-            timestamp,
-            thinkingVariant: "Steps",
-            thinkingLines: [`Connecting to ${meta.model}`],
-            reasoningText: "",
-            thinkingDurationMs: 0,
-            jobStatus: "running",
-          };
+        : isOfflineWithoutLocal
+          ? {
+              id: assistantMsgId,
+              role: "assistant",
+              content: runOfflineLocalAssistant(trimmed, {
+                isLocalWebGpuReady: hasWebGpuReady,
+                backend: settings.localBackend,
+              }),
+              model: meta.model,
+              effort: meta.effort,
+              timestamp,
+              thinkingVariant: "Steps",
+              thinkingLines: ["Served from offline workspace cache"],
+              jobStatus: "completed",
+            }
+          : useWebGpuLocal
+            ? {
+                id: assistantMsgId,
+                role: "assistant",
+                content: "",
+                model: `Nexora Nano (${getLocalModelPreset(settings.localModelTier).shortLabel})`,
+                effort: meta.effort,
+                timestamp,
+                thinkingVariant: "Steps",
+                thinkingLines: [
+                  `Running on-device WebGPU (${getLocalModelPreset(settings.localModelTier).shortLabel})`,
+                ],
+                reasoningText: "",
+                thinkingDurationMs: 0,
+                jobStatus: "running",
+              }
+            : {
+                id: assistantMsgId,
+                role: "assistant",
+                content: "",
+                model: meta.model,
+                effort: meta.effort,
+                timestamp,
+                thinkingVariant: "Steps",
+                thinkingLines: [`Connecting to ${meta.model}`],
+                reasoningText: "",
+                thinkingDurationMs: 0,
+                jobStatus: "running",
+              };
 
     const targetThreadId = activeThread?.id ?? `thread_${Date.now()}`;
     const isBrandNewThread = !activeThread;
     const titleSource = trimmed || attachmentNames[0] || "New chat";
     const computedTitle =
       activeThread?.title ??
-      (titleSource.length > 34 ? `${titleSource.slice(0, 34).trim()}…` : titleSource);
-    if (isBrandNewThread && !isOfflineWithoutLocal) {
+      (instantLabTab === "micrograd"
+        ? "Micrograd & Backprop Lab"
+        : instantLabTab === "attention"
+          ? "Transformer Attention Lab"
+          : instantLabTab === "matmul"
+            ? "Matrix Multiplication Lab"
+            : titleSource.length > 34
+              ? `${titleSource.slice(0, 34).trim()}…`
+              : titleSource);
+    if (isBrandNewThread && !isLocalServed && !isBuiltInAssistant && !useWebGpuLocal) {
       pendingAiTitlesRef.current.set(targetThreadId, {
         fallbackTitle: computedTitle,
         prompt: titleSource,
@@ -2503,13 +2761,63 @@ export default function App() {
       });
     }
 
-    const historyTurns = (activeThread?.messages ?? [])
+    const extraction = extractMemoriesFromMessage(trimmed, {
+      threadId: targetThreadId,
+      threadTitle: computedTitle,
+    });
+    const prevMemories = memoryFactsRef.current;
+    const nextMemories =
+      extraction.clearAll || extraction.forgetTargets.length > 0 || extraction.upserts.length > 0
+        ? applyMemoryExtraction(prevMemories, extraction)
+        : prevMemories;
+    if (nextMemories !== prevMemories) {
+      setMemoryFacts(nextMemories);
+      memoryFactsRef.current = nextMemories;
+      saveLocalMemoriesSync(nextMemories);
+      void saveOfflineMemories(nextMemories);
+      const fbUser = firebaseUserRef.current;
+      if (fbUser && fbUser.emailVerified && navigator.onLine) {
+        if (extraction.clearAll) {
+          void deleteAllFirebaseMemories(fbUser.uid).catch(() => {});
+        } else {
+          const nextIds = new Set(nextMemories.map((m) => m.id));
+          for (const oldMem of prevMemories) {
+            if (!nextIds.has(oldMem.id)) {
+              void deleteFirebaseMemory(fbUser.uid, oldMem.id).catch(() => {});
+            }
+          }
+          for (const up of extraction.upserts) {
+            void syncMemoryToFirestore(fbUser.uid, up).catch(() => {});
+          }
+        }
+      }
+    }
+
+    const threadDigests = buildThreadMemoryDigests(threadsRef.current, targetThreadId);
+
+    const baseHistoryTurns = (activeThread?.messages ?? [])
       .filter((m) => m.content.trim() && m.jobStatus !== "error")
       .slice(-16)
       .map((m) => ({
         role: m.role,
         content: m.content,
       }));
+    const memorySummaryNote =
+      nextMemories.length > 0 || threadDigests.length > 0
+        ? [
+            nextMemories.length > 0
+              ? `Saved user memory: ${nextMemories.slice(0, 10).map((f) => `${f.key}=${f.value}`).join("; ")}`
+              : "",
+            threadDigests.length > 0
+              ? `Recent other chats: ${threadDigests.slice(0, 4).map((d) => `"${d.title}": ${d.summary}`).join(" | ")}`
+              : "",
+          ]
+            .filter(Boolean)
+            .join("\n")
+        : "";
+    const historyTurns = memorySummaryNote
+      ? [{ role: "assistant" as const, content: `[Workspace Memory Context]\n${memorySummaryNote}` }, ...baseHistoryTurns]
+      : baseHistoryTurns;
 
     setActiveView("chat");
     setActiveThreadId(targetThreadId);
@@ -2541,13 +2849,13 @@ export default function App() {
           })();
 
       persistThreadsLocally(next);
-      if (isOfflineWithoutLocal && navigator.onLine) {
+      if (isLocalServed && navigator.onLine) {
         void pushThreadsToServer(next);
       }
       return next;
     });
 
-    if (isOfflineWithoutLocal) {
+    if (isLocalServed) {
       if (updatedThreadForFirestore) {
         mirrorThreadToFirestore(updatedThreadForFirestore);
       }
@@ -2558,6 +2866,213 @@ export default function App() {
     if (!notifiedMsgStatusRef.current.has(`${assistantMsgId}:start`)) {
       notifiedMsgStatusRef.current.add(`${assistantMsgId}:start`);
       notifyGenerationStatus(settingsRef.current, "start");
+    }
+
+    if (useBuiltInStream) {
+      const builtInKey = `local:${assistantMsgId}`;
+      const builtInController = new AbortController();
+      activeJobStreamsRef.current.set(builtInKey, builtInController);
+      const builtInStartedAt = Date.now();
+      let builtInFirstAnswerAt: number | null = null;
+      let streamedText = "";
+      let streamedThought = "";
+      let collectedSources: SourceLink[] = [];
+      let thinkingLines = ["Running Nexora Pure-TS Engine"];
+
+      try {
+        const result = await streamNexoraBuiltInAssistant({
+          prompt: trimmed,
+          history: builtInHistory,
+          memoryFacts: nextMemories,
+          threadDigests,
+          activeThreadTitle: computedTitle,
+          effort: meta.effort,
+          language: settings.language,
+          isOnline,
+          hasWebGpuReady,
+          localWebGpuTier: settings.localModelTier,
+          hasSavedByokModels,
+          signal: builtInController.signal,
+          onProgress: ({ progress, text }) => {
+            setLocalDownloadProgress(progress);
+            setLocalStatusText(text);
+          },
+          onThinkingLine: (line) => {
+            if (!thinkingLines.includes(line)) {
+              thinkingLines = [...thinkingLines.slice(-8), line];
+            }
+          },
+          onSources: (incoming) => {
+            collectedSources = incoming;
+            setThreads((prev) =>
+              prev.map((t) =>
+                t.id !== targetThreadId
+                  ? t
+                  : {
+                      ...t,
+                      messages: t.messages.map((m) =>
+                        m.id === assistantMsgId ? { ...m, sources: incoming } : m
+                      ),
+                    }
+              )
+            );
+          },
+          onThought: (delta) => {
+            streamedThought += delta;
+            const elapsed = Math.max(80, Date.now() - builtInStartedAt);
+            setThreads((prev) =>
+              prev.map((t) =>
+                t.id !== targetThreadId
+                  ? t
+                  : {
+                      ...t,
+                      updatedAt: "Just now",
+                      messages: t.messages.map((m) =>
+                        m.id === assistantMsgId
+                          ? {
+                              ...m,
+                              reasoningText: streamedThought,
+                              thinkingDurationMs: elapsed,
+                              thinkingVariant: "Reasoning",
+                              thinkingLines,
+                            }
+                          : m
+                      ),
+                    }
+              )
+            );
+          },
+          onReplaceText: (cleaned) => {
+            streamedText = cleaned;
+            setThreads((prev) =>
+              prev.map((t) =>
+                t.id !== targetThreadId
+                  ? t
+                  : {
+                      ...t,
+                      updatedAt: "Just now",
+                      messages: t.messages.map((m) =>
+                        m.id === assistantMsgId ? { ...m, content: cleaned } : m
+                      ),
+                    }
+              )
+            );
+          },
+          onDelta: (delta) => {
+            if (builtInFirstAnswerAt === null) {
+              builtInFirstAnswerAt = Date.now();
+            }
+            streamedText += delta;
+            const thoughtElapsed = Math.max(80, builtInFirstAnswerAt - builtInStartedAt);
+            setThreads((prev) =>
+              prev.map((t) =>
+                t.id !== targetThreadId
+                  ? t
+                  : {
+                      ...t,
+                      updatedAt: "Just now",
+                      messages: t.messages.map((m) =>
+                        m.id === assistantMsgId
+                          ? {
+                              ...m,
+                              content: streamedText,
+                              thinkingDurationMs: thoughtElapsed,
+                            }
+                          : m
+                      ),
+                    }
+              )
+            );
+          },
+        });
+
+        const wasStopped =
+          builtInController.signal.aborted || cancelledMsgIdsRef.current.has(assistantMsgId);
+        cancelledMsgIdsRef.current.delete(assistantMsgId);
+        const finalContent =
+          streamedText.trim()
+            ? streamedText
+            : wasStopped
+              ? "Response stopped."
+              : result.markdown;
+        const finalTitle =
+          isBrandNewThread && result.titleHint ? result.titleHint : undefined;
+        const finalDurationMs =
+          builtInFirstAnswerAt !== null
+            ? Math.max(80, builtInFirstAnswerAt - builtInStartedAt)
+            : Math.max(80, Date.now() - builtInStartedAt);
+
+        let completedThread: WorkspaceThread | null = null;
+        setThreads((prev) => {
+          const next = prev.map((t) => {
+            if (t.id !== targetThreadId) return t;
+            const upd: WorkspaceThread = {
+              ...t,
+              ...(finalTitle ? { title: finalTitle } : {}),
+              updatedAt: "Just now",
+              messages: t.messages.map((m) =>
+                m.id === assistantMsgId
+                  ? {
+                      ...m,
+                      content: finalContent,
+                      reasoningText: streamedThought || m.reasoningText,
+                      thinkingDurationMs: finalDurationMs,
+                      thinkingVariant: streamedThought.trim() ? "Reasoning" : "Steps",
+                      thinkingLines: wasStopped
+                        ? [...thinkingLines, "Generation stopped"]
+                        : thinkingLines,
+                      sources: collectedSources.length > 0 ? collectedSources : result.sources,
+                      jobStatus: "completed",
+                    }
+                  : m
+              ),
+            };
+            completedThread = upd;
+            return upd;
+          });
+          persistThreadsLocally(next);
+          if (navigator.onLine) {
+            void pushThreadsToServer(next);
+          }
+          return next;
+        });
+
+        if (completedThread) {
+          mirrorThreadToFirestore(completedThread);
+        }
+        if (!wasStopped && !notifiedMsgStatusRef.current.has(`${assistantMsgId}:complete`)) {
+          notifiedMsgStatusRef.current.add(`${assistantMsgId}:complete`);
+          notifyGenerationStatus(settingsRef.current, "complete");
+        }
+      } catch {
+        const fallback = runNexoraBuiltInAssistant(trimmed, {
+          hasWebGpuReady,
+          hasSavedByokModels,
+          history: builtInHistory,
+          memoryFacts: nextMemories,
+          threadDigests,
+          activeThreadTitle: computedTitle,
+        });
+        setThreads((prev) => {
+          const next = prev.map((t) =>
+            t.id !== targetThreadId
+              ? t
+              : {
+                  ...t,
+                  messages: t.messages.map((m) =>
+                    m.id === assistantMsgId
+                      ? { ...m, content: fallback.markdown, jobStatus: "completed" as const }
+                      : m
+                  ),
+                }
+          );
+          persistThreadsLocally(next);
+          return next;
+        });
+      } finally {
+        activeJobStreamsRef.current.delete(builtInKey);
+      }
+      return;
     }
 
     if (useWebGpuLocal) {
@@ -2608,6 +3123,8 @@ export default function App() {
         const cleanedResult = await streamLocalWebGpuChat({
           prompt: trimmed,
           history: historyTurns,
+          tier: settings.localModelTier,
+          assistantName: "Nexora Nano",
           language: settings.language,
           effort: meta.effort,
           signal: localController.signal,
@@ -2718,7 +3235,7 @@ export default function App() {
                       thinkingDurationMs: finalDurationMs,
                       thinkingVariant: streamedThought.trim() ? "Reasoning" : "Steps",
                       thinkingLines: [
-                        "Ran on-device WebGPU (SmolLM2 360M)",
+                        `Ran on-device WebGPU (${getLocalModelPreset(settings.localModelTier).shortLabel})`,
                         wasStopped ? "Generation stopped" : "Response completed",
                       ],
                       jobStatus: "completed",
@@ -3160,6 +3677,53 @@ export default function App() {
                   placeholder="Ask anything"
                   className="mx-auto"
                 />
+              </div>
+
+              <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+                {(
+                  [
+                    {
+                      tab: "pipeline" as NeuralLabTab,
+                      label: "Deep AI Pipeline Lab",
+                      prompt:
+                        "Open the pure-TypeScript 4-stage Deep AI training & inference pipeline lab",
+                    },
+                    {
+                      tab: "micrograd" as NeuralLabTab,
+                      label: "Micrograd & Backprop Lab",
+                      prompt:
+                        "Open the pure-TypeScript Micrograd & backpropagation lab",
+                    },
+                    {
+                      tab: "attention" as NeuralLabTab,
+                      label: "Transformer Attention Lab",
+                      prompt:
+                        "Open the pure-TypeScript Transformer self-attention lab",
+                    },
+                    {
+                      tab: "matmul" as NeuralLabTab,
+                      label: "Matrix Multiply Lab",
+                      prompt:
+                        "Open the pure-TypeScript matrix multiplication tracer",
+                    },
+                  ] as const
+                ).map((preset) => (
+                  <button
+                    key={preset.tab}
+                    type="button"
+                    onClick={() =>
+                      void appendMessagePair(preset.prompt, {
+                        model: selectedComposerModel,
+                        effort: selectedEffort,
+                        attachments: [],
+                        forceLabTab: preset.tab,
+                      })
+                    }
+                    className="rounded-control border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-2 shadow-hairline transition-colors hover:bg-hover hover:text-ink"
+                  >
+                    {preset.label}
+                  </button>
+                ))}
               </div>
 
               {/* Adaptive Cards — Hidden for first-time users with 0 chats */}

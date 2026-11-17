@@ -24,6 +24,7 @@ import {
 } from "firebase/firestore";
 import firebaseConfig from "../../firebase-applet-config.json";
 import type { ChatFolder, WorkspaceMessage, WorkspaceThread } from "../data/workspaceThreads";
+import type { ChatMemoryFact } from "./chatMemory";
 import type { WorkspaceSettingsSnapshot } from "./offlineStore";
 
 const app = initializeApp(firebaseConfig);
@@ -527,5 +528,109 @@ export async function deleteAllFirebaseThreads(uid: string): Promise<void> {
     }
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, threadsPath);
+  }
+}
+
+export async function syncMemoryToFirestore(
+  uid: string,
+  fact: ChatMemoryFact
+): Promise<void> {
+  if (!auth.currentUser?.emailVerified) return;
+  const memId = sanitizeId(fact.id);
+  const memPath = `users/${uid}/memories/${memId}`;
+  const memRef = doc(db, "users", uid, "memories", memId);
+  try {
+    const existingSnap = await getDoc(memRef);
+    const existingCreatedAt = existingSnap.exists()
+      ? (existingSnap.data().createdAt as Timestamp)
+      : null;
+    const category =
+      fact.category === "identity" ||
+      fact.category === "preference" ||
+      fact.category === "project" ||
+      fact.category === "fact"
+        ? fact.category
+        : "fact";
+    const payload: Record<string, unknown> = {
+      id: memId,
+      ownerId: uid,
+      category,
+      key: String(fact.key || "Note").slice(0, 80),
+      value: String(fact.value || "").slice(0, 400),
+      createdAt: existingCreatedAt ?? serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+    if (fact.sourceThreadId) {
+      payload.sourceThreadId = sanitizeId(fact.sourceThreadId);
+    }
+    if (fact.sourceThreadTitle) {
+      payload.sourceThreadTitle = String(fact.sourceThreadTitle).slice(0, 160);
+    }
+    await setDoc(memRef, payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, memPath);
+  }
+}
+
+export async function loadFirebaseMemories(uid: string): Promise<ChatMemoryFact[]> {
+  if (!auth.currentUser?.emailVerified) return [];
+  const memoriesPath = `users/${uid}/memories`;
+  try {
+    const snap = await getDocs(
+      query(collection(db, "users", uid, "memories"), where("ownerId", "==", uid))
+    );
+    const items: ChatMemoryFact[] = snap.docs.map((mDoc) => {
+      const md = mDoc.data();
+      const updatedTs = md.updatedAt as Timestamp | undefined;
+      const cat = md.category;
+      return {
+        id: String(md.id || mDoc.id),
+        category:
+          cat === "identity" || cat === "preference" || cat === "project" || cat === "fact"
+            ? cat
+            : "fact",
+        key: String(md.key || "Note"),
+        value: String(md.value || ""),
+        sourceThreadId:
+          typeof md.sourceThreadId === "string" && md.sourceThreadId
+            ? md.sourceThreadId
+            : undefined,
+        sourceThreadTitle:
+          typeof md.sourceThreadTitle === "string" && md.sourceThreadTitle
+            ? md.sourceThreadTitle
+            : undefined,
+        updatedAt: updatedTs?.toMillis?.() ?? Date.now(),
+      };
+    });
+    items.sort((a, b) => b.updatedAt - a.updatedAt);
+    return items;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, memoriesPath);
+  }
+}
+
+export async function deleteFirebaseMemory(uid: string, memoryId: string): Promise<void> {
+  if (!auth.currentUser?.emailVerified) return;
+  const cleanId = sanitizeId(memoryId);
+  const memPath = `users/${uid}/memories/${cleanId}`;
+  try {
+    await deleteDoc(doc(db, "users", uid, "memories", cleanId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, memPath);
+  }
+}
+
+export async function deleteAllFirebaseMemories(uid: string): Promise<void> {
+  if (!auth.currentUser?.emailVerified) return;
+  const memoriesPath = `users/${uid}/memories`;
+  try {
+    const snap = await getDocs(
+      query(collection(db, "users", uid, "memories"), where("ownerId", "==", uid))
+    );
+    for (const mDoc of snap.docs) {
+      await deleteDoc(mDoc.ref);
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, memoriesPath);
   }
 }
